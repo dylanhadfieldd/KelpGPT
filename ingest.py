@@ -39,6 +39,8 @@ def ingest():
                 [content],
                 metadata=[{"source": filename}]
             )
+
+            )
             documents.extend(chunks)
         except Exception as e:
             print(f"❌ Failed to process {filename}: {e}")
