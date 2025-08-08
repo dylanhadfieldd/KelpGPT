@@ -1,5 +1,10 @@
 # Ignore data and logs
-data/
+# Ignore data folder by default
+data/*
+# But allow specific test or placeholder files
+!data/.gitkeep
+!data/test.txt
+
 logs/
 __pycache__/
 *.pyc
