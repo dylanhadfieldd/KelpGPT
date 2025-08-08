@@ -5,19 +5,22 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
 
-from utils.parser import parse_document
+from utils.parser import parse_document  # Custom file parser
 
-# Load .env vars
+# Load environment variables
 load_dotenv()
 
+# Constants
 DATA_DIR = "data"
-CHROMA_DIR = "embeddings"
+EMBEDDINGS_DIR = "embeddings"
 
+# Embedding model
 embedding_model = OpenAIEmbeddings()
 
+# Text splitter config
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
     chunk_overlap=50
@@ -33,7 +36,7 @@ def ingest():
             content = parse_document(filepath)
             chunks = text_splitter.create_documents(
                 [content],
-                metadatas=[{"source": filename}]  # <-- FIXED LINE
+                metadatas=[{"source": filename}]
             )
             documents.extend(chunks)
         except Exception as e:
@@ -41,8 +44,9 @@ def ingest():
 
     print(f"✅ Parsed {len(documents)} chunks. Now embedding and storing...")
 
-    Chroma.from_documents(documents, embedding_model, persist_directory=CHROMA_DIR)
-    print(f"✅ Ingestion complete. Embeddings stored in '{CHROMA_DIR}'.")
+    # Use FAISS to store embeddings
+    FAISS.from_documents(documents, embedding_model).save_local(EMBEDDINGS_DIR)
+    print(f"✅ Ingestion complete. Embeddings stored in '{EMBEDDINGS_DIR}'.")
 
 if __name__ == "__main__":
     ingest()
