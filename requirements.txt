@@ -1,0 +1,9 @@
+openai
+langchain
+chromadb
+streamlit
+pypdf
+python-docx
+pandas
+pdfplumber
+tqdm
