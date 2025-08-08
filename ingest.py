@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 
 from utils.parser import parse_document  # Custom file parser
 
@@ -15,7 +15,7 @@ load_dotenv()
 
 # Constants
 DATA_DIR = "data"
-EMBEDDINGS_DIR = "embeddings"
+CHROMA_DIR = "embeddings"
 
 # Embedding model
 embedding_model = OpenAIEmbeddings()
@@ -44,9 +44,9 @@ def ingest():
 
     print(f"✅ Parsed {len(documents)} chunks. Now embedding and storing...")
 
-    # Use FAISS to store embeddings
-    FAISS.from_documents(documents, embedding_model).save_local(EMBEDDINGS_DIR)
-    print(f"✅ Ingestion complete. Embeddings stored in '{EMBEDDINGS_DIR}'.")
+    # Use Chroma to store embeddings
+    Chroma.from_documents(documents, embedding_model, persist_directory=CHROMA_DIR)
+    print(f"✅ Ingestion complete. Embeddings stored in '{CHROMA_DIR}'.")
 
 if __name__ == "__main__":
     ingest()
