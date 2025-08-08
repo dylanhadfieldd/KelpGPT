@@ -2,7 +2,7 @@
 
 import os
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import Chroma
 from utils.parser import parse_document  # custom parser
 from dotenv import load_dotenv
