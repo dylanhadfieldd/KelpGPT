@@ -13,11 +13,15 @@ load_dotenv()
 
 # Initialize models
 embedding_model = OpenAIEmbeddings()
-vectorstore = Chroma(persist_directory="embeddings", embedding_function=embedding_model)
+vectorstore = FAISS.load_local("embeddings", embedding_model)
 retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 llm = ChatOpenAI(temperature=0, model="gpt-4")
 
-qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=retriever,
+    return_source_documents=True
+)
 
 # --- UI Layout ---
 st.set_page_config(page_title="KelpGPT", layout="centered")
@@ -34,5 +38,3 @@ if query:
         with st.expander("📄 Sources"):
             for doc in result["source_documents"]:
                 st.markdown(f"• **{doc.metadata.get('source', 'Unknown')}**")
-
-
