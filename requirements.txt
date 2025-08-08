@@ -1,8 +1,19 @@
-streamlit
-python-dotenv
-openai
-langchain
-langchain-community
-langchain-openai
-tqdm
-pysqlite3-binary
+# Figures & PDF parsing
+pymupdf==1.24.9           # PyMuPDF
+Pillow==10.4.0
+
+# Vector DB
+chromadb==0.5.5
+
+# Embeddings
+openai==1.40.2            # if you use OpenAI embeddings
+sentence-transformers==3.0.1  # fallback/local embedding option
+
+# (Optional) OCR if you have scanned PDFs
+pytesseract==0.3.13
+
+# (Optional) pdffigures2 requires Java + preinstall; we wrap it if available
+
+# Streamlit (if not already present)
+streamlit==1.37.1
+
