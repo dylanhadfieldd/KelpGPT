@@ -1,9 +1,8 @@
-openai
-langchain
-chromadb
 streamlit
-pypdf
-python-docx
-pandas
-pdfplumber
+python-dotenv
 tqdm
+langchain
+langchain-community
+langchain-openai
+chromadb
+openai
