@@ -1,0 +1,6 @@
+# Ignore data and logs
+data/
+logs/
+__pycache__/
+*.pyc
+.env
