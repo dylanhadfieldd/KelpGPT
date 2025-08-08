@@ -1,10 +1,10 @@
-# app.py
+# app/app.py
 
 import os
 import streamlit as st
 from dotenv import load_dotenv
 
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import RetrievalQA
 
@@ -13,15 +13,11 @@ load_dotenv()
 
 # Initialize models
 embedding_model = OpenAIEmbeddings()
-vectorstore = FAISS.load_local("embeddings", embedding_model)
+vectorstore = Chroma(persist_directory="embeddings", embedding_function=embedding_model)
 retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 llm = ChatOpenAI(temperature=0, model="gpt-4")
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=retriever,
-    return_source_documents=True
-)
+qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
 
 # --- UI Layout ---
 st.set_page_config(page_title="KelpGPT", layout="centered")
