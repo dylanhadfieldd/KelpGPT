@@ -1,8 +1,8 @@
 streamlit
 python-dotenv
-tqdm
+openai
 langchain
 langchain-community
 langchain-openai
-chromadb
-openai
+tqdm
+pysqlite3-binary
