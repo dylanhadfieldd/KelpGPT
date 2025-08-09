@@ -1,6 +1,17 @@
 # config.py
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Try loading from .env for local dev
+load_dotenv()
+
+# === Streamlit secrets (only available in deployed app) ===
+try:
+    import streamlit as st
+    STREAMLIT_SECRETS = st.secrets if hasattr(st, "secrets") else {}
+except ImportError:
+    STREAMLIT_SECRETS = {}
 
 # === Base data dirs ===
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -21,7 +32,10 @@ MAX_FIGS_PER_PDF = int(os.getenv("MAX_FIGS_PER_PDF", "100"))
 
 # === Embeddings ===
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")  # or "local"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = (
+    STREAMLIT_SECRETS.get("OPENAI_API_KEY")
+    or os.getenv("OPENAI_API_KEY", "")
+)
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")
 LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "all-MiniLM-L6-v2")
 
