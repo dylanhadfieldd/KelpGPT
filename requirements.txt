@@ -10,7 +10,7 @@ langchain-openai>=0.2
 
 # --- Vector DB ---
 chromadb>=0.5.5
-# SQLite fix for Chroma (only for Python < 3.13 where sqlite3 is missing FTS5/JSON1)
+# SQLite fix for Chroma (auto-skips on 3.13+)
 pysqlite3-binary; python_version < "3.13"
 
 # --- PDF & doc parsing ---
