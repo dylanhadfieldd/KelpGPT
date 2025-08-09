@@ -2,7 +2,7 @@
 import os, glob, hashlib
 from typing import List
 from pypdf import PdfReader
-from openai import OpenAI
+
 
 # load .env if present
 try:
