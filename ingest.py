@@ -1,134 +1,80 @@
-#!/usr/bin/env python3
-from __future__ import annotations
+# ingest_cli.py
+import os, glob, hashlib
 from typing import List
-from pathlib import Path
+from pypdf import PdfReader
+from openai import OpenAI
 
-# 1) Load .env early
+# load .env if present
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# 2) Config after env
-from config import (
-    PAPERS_DIR, PAPERS_DIR_STR,
-    CHROMA_PERSIST_DIR_STR,
-    EMBEDDING_PROVIDER, OPENAI_API_KEY,
-    OPENAI_EMBED_MODEL, LOCAL_EMBED_MODEL,
-    TEXT_COLLECTION,
-)
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
+TEXT_COLLECTION    = os.getenv("TEXT_COLLECTION", "papers_text")
 
-def _make_embeddings_fn():
-    if EMBEDDING_PROVIDER.lower() == "local":
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(LOCAL_EMBED_MODEL)
-        def embed(batch: List[str]): return model.encode(batch, normalize_embeddings=True).tolist()
-        return embed
-    from openai import OpenAI
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set (add it to .env).")
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    def embed(batch: List[str]):
-        resp = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=batch)
-        return [d.embedding for d in resp.data]
-    return embed
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY in env/.env")
 
-def ingest_with_langchain() -> int:
-    try:
-        from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, TextLoader, Docx2txtLoader
-        from langchain.text_splitter import RecursiveCharacterTextSplitter
-        try:
-            from langchain_openai import OpenAIEmbeddings
-        except Exception:
-            from langchain_community.embeddings import OpenAIEmbeddings
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        from langchain_community.vectorstores import Chroma
-    except Exception as e:
-        raise RuntimeError(f"LangChain path unavailable: {e}")
-
-    loaders = [
-        DirectoryLoader(PAPERS_DIR_STR, glob="**/*.pdf", loader_cls=PyPDFLoader, show_progress=True),
-        DirectoryLoader(PAPERS_DIR_STR, glob="**/*.txt", loader_cls=TextLoader, show_progress=True),
-    ]
-    try:
-        loaders.append(DirectoryLoader(PAPERS_DIR_STR, glob="**/*.docx", loader_cls=Docx2txtLoader, show_progress=True))
-    except Exception:
-        pass
-
-    docs = []
-    for L in loaders:
-        docs.extend(L.load())
-    if not docs:
-        print(f"No documents found under {PAPERS_DIR_STR}")
-        return 0
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
-    chunks = splitter.split_documents(docs)
-
-    if EMBEDDING_PROVIDER.lower() == "local":
-        embeddings = HuggingFaceEmbeddings(model_name=LOCAL_EMBED_MODEL)
-    else:
-        embeddings = OpenAIEmbeddings(model=OPENAI_EMBED_MODEL, api_key=OPENAI_API_KEY)
-
-    vectordb = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=CHROMA_PERSIST_DIR_STR,
-        collection_name=TEXT_COLLECTION,
-    )
-    vectordb.persist()
-    print(f"Ingested {len(chunks)} chunks into {CHROMA_PERSIST_DIR_STR}/{TEXT_COLLECTION}")
-    return len(chunks)
-
-def _load_pdf_text(pdf_path: Path) -> str:
-    import pdfplumber
+def _extract_text(path: str) -> str:
+    reader = PdfReader(path)
     out = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for p in pdf.pages:
-            t = p.extract_text(x_tolerance=1.5, y_tolerance=1.5) or ""
-            if t.strip():
-                out.append(t)
+    for p in reader.pages:
+        try:
+            t = p.extract_text() or ""
+        except Exception:
+            t = ""
+        if t: out.append(t)
     return "\n\n".join(out)
 
-def _split_text(text: str, size=1200, overlap=200) -> List[str]:
-    if not text:
-        return []
-    chunks, i, n = [], 0, len(text)
-    while i < n:
-        end = min(i + size, n)
-        chunk = text[i:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        i = end - overlap if end - overlap > i else end
+def _chunk(text: str, size=1400, overlap=200) -> List[str]:
+    words = text.split()
+    chunks, i = [], 0
+    while i < len(words):
+        j = min(i + size, len(words))
+        chunks.append(" ".join(words[i:j]))
+        i = j - overlap if j - overlap > i else j
     return chunks
 
-def ingest_direct() -> int:
+def main(paths: List[str]):
     import chromadb
-    from uuid import uuid4
+    from chromadb.utils import embedding_functions
 
-    embed = _make_embeddings_fn()
-    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR_STR)
-    col = client.get_or_create_collection(name=TEXT_COLLECTION)
+    ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=OPENAI_API_KEY,
+        model_name="text-embedding-3-small",
+    )
+    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    coll = client.get_or_create_collection(name=TEXT_COLLECTION, embedding_function=ef)
 
-    total = 0
-    for pdf in sorted(Path(PAPERS_DIR).glob("**/*.pdf")):
-        text = _load_pdf_text(pdf)
-        chunks = _split_text(text)
-        if not chunks:
+    added = 0
+    for p in paths:
+        text = _extract_text(p)
+        if not text.strip():
+            print(f"Skip (no text): {p}")
             continue
-        ids = [f"pdf::{pdf.name}::c{ix}::{uuid4().hex[:8]}" for ix, _ in enumerate(chunks)]
-        embs = embed(chunks)
-        metas = [{"source": pdf.as_posix(), "file_name": pdf.name, "chunk_index": ix} for ix, _ in enumerate(chunks)]
-        col.upsert(ids=ids, embeddings=embs, documents=chunks, metadatas=metas)
-        total += len(chunks)
-
-    print(f"Ingested {total} chunks into {CHROMA_PERSIST_DIR_STR}/{TEXT_COLLECTION}")
-    return total
+        chunks = _chunk(text)
+        with open(p, "rb") as fh:
+            digest = hashlib.sha1(fh.read()).hexdigest()
+        ids = [f"{digest}-{i}" for i in range(len(chunks))]
+        metas = [{"filename": os.path.basename(p), "chunk": i} for i in range(len(chunks))]
+        coll.upsert(documents=chunks, ids=ids, metadatas=metas)
+        print(f"Ingested {len(chunks)} chunks from {p}")
+        added += len(chunks)
+    print(f"Done. Total chunks added: {added}")
 
 if __name__ == "__main__":
-    try:
-        n = ingest_with_langchain()
-    except RuntimeError as e:
-        print(f"[ingest] Falling back to direct mode: {e}")
-        n = ingest_direct()
+    import argparse, os
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inputs", nargs="+", help="PDF files or glob patterns")
+    args = ap.parse_args()
+
+    # expand globs on Windows too
+    files = []
+    for pat in args.inputs:
+        files.extend(glob.glob(pat))
+    if not files:
+        raise SystemExit("No matching PDFs found.")
+    main(files)
