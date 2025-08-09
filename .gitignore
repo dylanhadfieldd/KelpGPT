@@ -9,3 +9,8 @@ logs/
 __pycache__/
 *.pyc
 .env
+.env
+chroma_db/
+data/figures/
+__pycache__/
+*.pyc
