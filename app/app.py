@@ -15,9 +15,9 @@ import json
 from typing import List, Tuple, Optional, Dict, Any
 import streamlit as st
 
-# --- logo path ---
+# --- images path ---
 LOGO_PATH = os.getenv("LOGO_PATH", "kelp_ark_logo.jpg")
-
+ICON_PATH = os.getenv("ICON_PATH", "icon.png")
 # Configure page ASAP so favicon/title appear on auth screen too
 st.set_page_config(page_title="KelpGPT", page_icon=LOGO_PATH, layout="wide")
 
@@ -349,7 +349,7 @@ with right:
 # Render prior messages (user/assistant only) with avatars
 for m in st.session_state.messages:
     if m["role"] in ("user", "assistant"):
-        avatar = "🙂" if m["role"] == "user" else LOGO_PATH
+        avatar = "🙂" if m["role"] == "user" else ICON_PATH
         with st.chat_message(m["role"], avatar=avatar):
             st.markdown(m["content"])
 
@@ -428,7 +428,7 @@ if prompt:
             convo_msgs.append(m)
 
     # Call OpenAI
-    with st.chat_message("assistant", avatar=LOGO_PATH):
+    with st.chat_message("assistant", avatar=ICON_PATH):
         with st.spinner("Thinking…"):
             try:
                 resp = client.chat.completions.create(
