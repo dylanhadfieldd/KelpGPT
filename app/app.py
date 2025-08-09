@@ -9,8 +9,13 @@
 import os
 import time
 from typing import List, Tuple, Optional
-
 import streamlit as st
+
+# --- Branding / logo path ---
+LOGO_PATH = os.getenv("LOGO_PATH", "kelp_ark_logo.jpg")
+
+# Configure page ASAP so favicon/title appear on auth screen too
+st.set_page_config(page_title="KelpGPT", page_icon=LOGO_PATH, layout="wide")
 
 # --- Local dev only: load .env if present (ignored in git) ---
 try:
@@ -161,10 +166,13 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
 # ---------------------------
 # UI Layout
 # ---------------------------
-st.set_page_config(page_title="KelpGPT", page_icon="🌿", layout="wide")
-
 with st.sidebar:
-    st.header("🌿 KelpGPT")
+    # Try Streamlit's built-in logo helper (v1.31+), else fallback to image
+    try:
+        st.logo(LOGO_PATH)
+    except Exception:
+        st.image(LOGO_PATH, use_container_width=True)
+    st.header("KelpGPT")
     st.caption("Internal research assistant")
 
     use_rag = st.toggle("Use document retrieval (RAG)", value=True,
@@ -212,13 +220,14 @@ if "messages" not in st.session_state:
         {"role": "system", "content": "You are KelpGPT, a precise, helpful marine science research assistant. Cite sources if provided in context."}
     ]
 
-st.title("🌿 KelpGPT — Internal")
+st.title("KelpGPT — Internal")
 st.caption("Protected by a 4‑digit passcode. All API calls use the server-side key.")
 
-# Render prior messages (user/assistant only)
+# Render prior messages (user/assistant only) with avatars
 for m in st.session_state.messages:
     if m["role"] in ("user", "assistant"):
-        with st.chat_message(m["role"]):
+        avatar = "🙂" if m["role"] == "user" else LOGO_PATH
+        with st.chat_message(m["role"], avatar=avatar):
             st.markdown(m["content"])
 
 # ---------------------------
@@ -253,7 +262,7 @@ prompt = st.chat_input("Ask something…")
 if prompt:
     # add user msg
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar="🙂"):
         st.markdown(prompt)
 
     # retrieve context if enabled
@@ -280,7 +289,7 @@ if prompt:
             convo_msgs.append(m)
 
     # Call OpenAI
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=LOGO_PATH):
         with st.spinner("Thinking…"):
             try:
                 resp = client.chat.completions.create(
