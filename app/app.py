@@ -17,7 +17,7 @@ import streamlit as st
 
 # --- images path ---
 LOGO_PATH = os.getenv("LOGO_PATH", "kelp_ark_logo.jpg")
-ICON_PATH = os.getenv("ICON_PATH", "icon.png")
+ICON_PATH = os.getenv("ICON_PATH", "icon.jpg")
 # Configure page ASAP so favicon/title appear on auth screen too
 st.set_page_config(page_title="KelpGPT", page_icon=LOGO_PATH, layout="wide")
 
