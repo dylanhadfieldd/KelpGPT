@@ -224,7 +224,7 @@ if "messages" not in st.session_state:
 left, right = st.columns([5, 1])
 with left:
     st.markdown("## I'm KARA, how can I help you?")
-    st.caption("KelpArk Research Assistant")
+    st.markdown("<h3 style='margin-top: -10px;'>KelpArk Research Assistant</h3>", unsafe_allow_html=True)
 with right:
     st.image(LOGO_PATH, use_container_width=True)
 
