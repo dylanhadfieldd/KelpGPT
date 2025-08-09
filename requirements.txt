@@ -1,14 +1,17 @@
 # --- Core app ---
 streamlit>=1.35
+python-dotenv>=1.0
 
 # --- OpenAI + LangChain ---
 openai>=1.40
 langchain>=0.2
 langchain-community>=0.2
+langchain-openai>=0.2
 
 # --- Vector DB ---
 chromadb>=0.5.5
-pysqlite3-binary>=0.5           # fixes sqlite issues on many hosts
+# SQLite fix for Chroma (only for Python < 3.13 where sqlite3 is missing FTS5/JSON1)
+pysqlite3-binary; python_version < "3.13"
 
 # --- PDF & doc parsing ---
 pypdf>=4.2
@@ -28,7 +31,6 @@ pytesseract>=0.3.10
 numpy>=1.26
 tqdm>=4.66
 rich>=13.7
-python-dotenv>=1.0
 
 # --- Optional local embeddings fallback ---
 sentence-transformers>=3.0
