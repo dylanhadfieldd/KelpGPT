@@ -11,7 +11,7 @@ import time
 from typing import List, Tuple, Optional
 import streamlit as st
 
-# --- Branding / logo path ---
+# --- logo path ---
 LOGO_PATH = os.getenv("LOGO_PATH", "kelp_ark_logo.jpg")
 
 # Configure page ASAP so favicon/title appear on auth screen too
@@ -220,8 +220,13 @@ if "messages" not in st.session_state:
         {"role": "system", "content": "You are KelpGPT, a precise, helpful marine science research assistant. Cite sources if provided in context."}
     ]
 
-st.title("KelpGPT — Internal")
-st.caption("Protected by a 4‑digit passcode. All API calls use the server-side key.")
+# --- Main header row (text left, logo right) ---
+left, right = st.columns([5, 1])
+with left:
+    st.markdown("## I'm KARA, how can I help you?")
+    st.caption("KelpArk Research Assistant")
+with right:
+    st.image(LOGO_PATH, use_container_width=True)
 
 # Render prior messages (user/assistant only) with avatars
 for m in st.session_state.messages:
