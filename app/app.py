@@ -4,11 +4,15 @@
 # - Key is stored in Streamlit Secrets (cloud) or .env (local)
 # - Teammates use a 4-digit passcode; your key is never revealed
 # - Optional: upload PDFs -> build local vector store (Chroma) for retrieval
+# - NEW: APA-style citations (auto + optional sidecar JSON)
 # ---------------------------------------------------------------
 
 import os
+import io
+import re
 import time
-from typing import List, Tuple, Optional
+import json
+from typing import List, Tuple, Optional, Dict, Any
 import streamlit as st
 
 # --- logo path ---
@@ -149,9 +153,28 @@ def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> List[s
         start = end - overlap if end - overlap > start else end
     return chunks
 
+def _parse_pdf_year(raw_date: Optional[str]) -> Optional[str]:
+    """Parse PDF CreationDate like 'D:20230715123456Z' -> '2023'."""
+    if not raw_date:
+        return None
+    m = re.search(r"(19|20)\d{2}", raw_date)
+    return m.group(0) if m else None
+
+def _extract_pdf_core_metadata(file_bytes: bytes) -> Dict[str, Any]:
+    """Best-effort pull of title/author/year from PDF metadata."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        md = reader.metadata or {}
+        title = (getattr(md, "title", None) or md.get("/Title") or "").strip() or None
+        authors = (getattr(md, "author", None) or md.get("/Author") or "").strip() or None
+        year = _parse_pdf_year(getattr(md, "creation_date", None) or md.get("/CreationDate"))
+        return {"title": title, "authors": authors, "year": year}
+    except Exception:
+        return {"title": None, "authors": None, "year": None}
+
 def _extract_text_from_pdf(file_bytes: bytes) -> str:
     from pypdf import PdfReader
-    import io
     reader = PdfReader(io.BytesIO(file_bytes))
     texts = []
     for page in reader.pages:
@@ -162,6 +185,44 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
         if t:
             texts.append(t)
     return "\n\n".join(texts)
+
+def _build_apa_citation(meta: Dict[str, Any], fallback_filename: str) -> str:
+    """
+    Render an APA-ish line from metadata.
+    Expected keys: apa_authors, apa_year, apa_title, apa_container, apa_doi, url
+    Falls back to PDF core metadata (title/authors/year) or filename.
+    """
+    authors = meta.get("apa_authors") or meta.get("authors")
+    year    = meta.get("apa_year") or meta.get("year")
+    title   = meta.get("apa_title") or meta.get("title")
+    journal = meta.get("apa_container") or meta.get("journal")
+    doi     = meta.get("apa_doi")
+    url     = meta.get("url")
+
+    # Fallback to filename if minimal info
+    if not (authors or title):
+        return fallback_filename
+
+    parts = []
+    if authors: parts.append(f"{authors}")
+    if year:    parts.append(f"({year}).")
+    if title:   parts.append(f"{title}.")
+    if journal: parts.append(f"*{journal}*.")
+    if doi:
+        parts.append(f"https://doi.org/{doi}")
+    elif url:
+        parts.append(f"{url}")
+
+    return " ".join(parts).strip()
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 # ---------------------------
 # UI Layout
@@ -184,27 +245,84 @@ with st.sidebar:
         "Add PDFs to the local index (Chroma). These are stored on the app server only.",
         type=["pdf"], accept_multiple_files=True
     )
+
+    # Optional: sidecar JSON mapping filenames -> APA fields
+    # Example schema:
+    # {
+    #   "Heat_Stress.pdf": {
+    #       "apa_authors": "Harden, M., ...",
+    #       "apa_year": "2025",
+    #       "apa_title": "Effects of heat stress on kelp physiology",
+    #       "apa_container": "Journal of Marine Science",
+    #       "apa_doi": "10.1234/abcd.2025.001",
+    #       "url": "https://example.org/heat_stress"
+    #   }
+    # }
+    meta_sidecar = st.file_uploader(
+        "Optional: metadata JSON (APA fields per filename)",
+        type=["json"],
+        accept_multiple_files=False
+    )
+
     if st.button("Ingest PDFs"):
         if not up_files:
             st.warning("No PDFs selected.")
         else:
+            sidecar_map: Dict[str, Dict[str, Any]] = {}
+            if meta_sidecar is not None:
+                try:
+                    sidecar_map = json.loads(meta_sidecar.read().decode("utf-8"))
+                except Exception as e:
+                    st.warning(f"Could not parse metadata JSON: {e}")
+
             with st.spinner("Ingesting…"):
                 _, collection = _get_chroma()
                 add_count = 0
                 for f in up_files:
                     raw = f.read()
+
+                    # Extract text
                     text = _extract_text_from_pdf(raw)
                     if not text.strip():
                         continue
                     chunks = _chunk_text(text)
-                    # Use content-addressable IDs so re-ingesting is idempotent-ish
+
+                    # Build per-file metadata (APA)
+                    core = _extract_pdf_core_metadata(raw)
+                    user = sidecar_map.get(f.name, {})
+
+                    base_meta = {
+                        "source_filename": f.name,
+                        # Preferred APA fields if provided by sidecar:
+                        "apa_authors": user.get("apa_authors"),
+                        "apa_year": user.get("apa_year"),
+                        "apa_title": user.get("apa_title"),
+                        "apa_container": user.get("apa_container"),
+                        "apa_doi": user.get("apa_doi"),
+                        "url": user.get("url"),
+                        # Best-effort fallbacks from PDF core metadata:
+                        "authors": core.get("authors"),
+                        "year": core.get("year"),
+                        "title": core.get("title"),
+                        "journal": user.get("apa_container"),  # for _build_apa_citation fallback
+                    }
+
+                    # Content-addressable IDs so re-ingesting is idempotent-ish
                     import hashlib
                     base = hashlib.sha1(raw).hexdigest()
                     ids = [f"{base}-{i}" for i in range(len(chunks))]
-                    metadatas = [{"filename": f.name, "chunk": i} for i in range(len(chunks))]
+                    metadatas = []
+                    for i in range(len(chunks)):
+                        m = dict(base_meta)  # copy
+                        m["chunk"] = i  # still store chunk for debugging if needed
+                        metadatas.append(m)
+
                     collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
                     add_count += len(chunks)
+
                 st.success(f"Ingested {add_count} chunks.")
+                if meta_sidecar is not None:
+                    st.info("Metadata JSON applied where filenames matched.")
 
     st.markdown("---")
     model = st.selectbox(
@@ -238,12 +356,18 @@ for m in st.session_state.messages:
 # ---------------------------
 # Retrieval helper
 # ---------------------------
-def retrieve(query: str, k: int = 5) -> List[Tuple[str, dict]]:
-    """Return list of (doc, metadata)"""
+def _get_collection():
     try:
         _, collection = _get_chroma()
+        return collection
     except Exception as e:
         st.warning(f"RAG not available: {e}")
+        return None
+
+def retrieve(query: str, k: int = 5) -> List[Tuple[str, dict]]:
+    """Return list of (doc, metadata)"""
+    collection = _get_collection()
+    if collection is None:
         return []
     res = collection.query(query_texts=[query], n_results=k)
     docs = res.get("documents", [[]])[0]
@@ -255,10 +379,21 @@ def format_context(ctx: List[Tuple[str, dict]]) -> str:
         return ""
     lines = []
     for i, (doc, meta) in enumerate(ctx, 1):
-        src = meta.get("filename", "doc")
+        src = meta.get("source_filename", "doc")
         chunk = meta.get("chunk", i)
         lines.append(f"[{i}] ({src} • chunk {chunk})\n{doc}")
     return "\n\n".join(lines)
+
+def build_apa_sources_note(ctx: List[Tuple[str, dict]]) -> str:
+    if not ctx:
+        return ""
+    apa_lines = []
+    for _, m in ctx:
+        apa = _build_apa_citation(m, m.get("source_filename", "Unknown source"))
+        apa_lines.append(apa)
+    apa_lines = _dedupe_preserve_order(apa_lines)
+    # Render as a newline list under "References"
+    return "\n\n**References**\n" + "\n".join(f"- {line}" for line in apa_lines)
 
 # ---------------------------
 # Chat submit
@@ -272,13 +407,12 @@ if prompt:
 
     # retrieve context if enabled
     context_block = ""
-    sources_note = ""
+    refs_block = ""
     if use_rag:
         ctx = retrieve(prompt, k=5)
         if ctx:
-            context_block = format_context(ctx)
-            sources = [f"{m.get('filename','doc')}:chunk{m.get('chunk','?')}" for _, m in ctx]
-            sources_note = "\n\n(Sources: " + ", ".join(sources) + ")"
+            context_block = format_context(ctx)  # model-visible
+            refs_block = build_apa_sources_note(ctx)  # reader-visible APA
 
     # Build messages for Chat Completions
     sys_msg = st.session_state.messages[0]  # system
@@ -306,10 +440,10 @@ if prompt:
             except Exception as e:
                 answer = f"Error from model: {e}"
 
-            st.markdown(answer + (sources_note if context_block else ""))
+            st.markdown(answer + (("\n\n" + refs_block) if refs_block else ""))
     # add assistant msg
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer + (sources_note if context_block else "")}
+        {"role": "assistant", "content": answer + (("\n\n" + refs_block) if refs_block else "")}
     )
 
 # ---------------------------
