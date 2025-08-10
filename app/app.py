@@ -12,6 +12,7 @@ import io
 import re
 import time
 import json
+import base64
 from typing import List, Tuple, Optional, Dict, Any
 import streamlit as st
 
@@ -38,13 +39,29 @@ def _open_or_none(p: Optional[Path]):
     except Exception:
         return None
 
+def _to_data_uri(p: Optional[Path]) -> Optional[str]:
+    if not p:
+        return None
+    try:
+        raw = p.read_bytes()
+        b64 = base64.b64encode(raw).decode("utf-8")
+        ext = p.suffix.lower()
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        return None
+
 # Your exact filenames (both in the same folder as app.py)
 LOGO_FILE = _first_existing_local("logo_icon.jpg")      # favicon + header + sidebar
 ICON_FILE = _first_existing_local("icon_kelp.png")      # assistant avatar
 
-# Configure page ASAP so favicon/title appear on auth screen too (use PIL or emoji fallback)
-page_icon_obj = _open_or_none(LOGO_FILE) or "🪸"
-st.set_page_config(page_title="KelpGPT", page_icon=page_icon_obj, layout="wide")
+# Configure page ASAP so favicon/title appear on auth screen too
+# IMPORTANT: pass a STRING PATH (not PIL) to avoid favicon cache weirdness
+st.set_page_config(
+    page_title="KelpGPT",
+    page_icon=(str(LOGO_FILE) if LOGO_FILE else "🪸"),
+    layout="wide"
+)
 
 # --- Local dev only: load .env if present (ignored in git) ---
 try:
@@ -358,17 +375,23 @@ if "messages" not in st.session_state:
         {"role": "system", "content": "You are KelpGPT, a precise, helpful marine science research assistant. Cite sources if provided in context."}
     ]
 
-# --- Main header row: logo next to 'I'm KARA...' ---
-header_left, header_right = st.columns([1, 9])
-with header_left:
-    if LOGO_FILE:
-        st.image(str(LOGO_FILE), width=60)
-with header_right:
-    st.markdown("## I'm KARA, how can I help you?")
-    st.markdown("<h3 style='margin-top: -10px;'>KelpArk Research Assistant</h3>", unsafe_allow_html=True)
+# --- Header: logo inline with text (perfect alignment) ---
+LOGO_DATA_URI = _to_data_uri(LOGO_FILE) if LOGO_FILE else None
+st.markdown(
+    f"""
+    <div style="display:flex;align-items:center;gap:12px;margin:6px 0 2px 0;">
+        {('<img src="'+LOGO_DATA_URI+'" style="width:48px;height:48px;border-radius:8px;object-fit:cover;">') if LOGO_DATA_URI else ''}
+        <div>
+            <div style="font-size:22px;font-weight:600;line-height:1.1;">I'm KARA, how can I help you?</div>
+            <div style="margin-top:2px;color:#8a8a8a;">KelpArk Research Assistant</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
-# Preload assistant avatar (PIL image or emoji fallback)
-AVATAR_ASSISTANT = _open_or_none(ICON_FILE) or "🤖"
+# Preload assistant avatar (use string path for robustness)
+AVATAR_ASSISTANT = (str(ICON_FILE) if ICON_FILE else "🤖")
 
 # Render prior messages (user/assistant only) with avatars
 for m in st.session_state.messages:
