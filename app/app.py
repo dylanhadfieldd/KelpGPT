@@ -4,7 +4,7 @@
 # - Key is stored in Streamlit Secrets (cloud) or .env (local)
 # - Teammates use a 4-digit passcode; your key is never revealed
 # - Optional: upload PDFs -> build local vector store (Chroma) for retrieval
-# - NEW: APA-style citations (auto + optional sidecar JSON)
+# - APA-style citations: prefer sidecar metadata via metadata.py; otherwise fallback
 # ---------------------------------------------------------------
 
 import os
@@ -18,6 +18,14 @@ import streamlit as st
 # === Robust image resolution: files live next to app.py ===
 from pathlib import Path
 from PIL import Image
+
+# === NEW: Sidecar metadata helper (zero-disruption Option A) ===
+# If metadata.py isn't present, we still run using fallback APA builder.
+try:
+    from metadata import load_or_init as _meta_load_or_init, ensure_reference_cache as _meta_ensure_cache
+    _HAS_METADATA_HELPER = True
+except Exception:
+    _HAS_METADATA_HELPER = False
 
 ROOT = Path(__file__).parent.resolve()
 
@@ -213,7 +221,7 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def _build_apa_citation(meta: Dict[str, Any], fallback_filename: str) -> str:
     """
-    Render an APA-ish line from metadata.
+    Render an APA-ish line from metadata (fallback path).
     Expected keys: apa_authors, apa_year, apa_title, apa_container, apa_doi, url
     Falls back to PDF core metadata (title/authors/year) or filename.
     """
@@ -249,6 +257,34 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
             out.append(x)
     return out
 
+# === NEW: Smart citation that prefers sidecar metadata (metadata.py) ===
+def _citation_from_meta(meta: Dict[str, Any]) -> str:
+    """
+    Priority:
+      1) Chroma-stored APA (if your ingest stored 'apa' per chunk)
+      2) metadata.py sidecar via meta['pdf_path'] (if present)
+      3) Fallback APA built from in-app fields
+    """
+    # (1) direct APA string from Chroma (if ingest wrote it)
+    apa_direct = meta.get("apa")
+    if isinstance(apa_direct, str) and apa_direct.strip():
+        return apa_direct.strip()
+
+    # (2) look for sidecar next to the PDF (requires ingest or known filesystem path)
+    pdf_path = meta.get("pdf_path")
+    if _HAS_METADATA_HELPER and isinstance(pdf_path, str) and pdf_path.strip():
+        try:
+            side_meta = _meta_load_or_init(pdf_path)
+            _meta_ensure_cache(side_meta)
+            apa = side_meta.get("reference_style_cache", {}).get("apa")
+            if isinstance(apa, str) and apa.strip():
+                return apa.strip()
+        except Exception:
+            pass  # fall through to (3)
+
+    # (3) fallback to best-effort APA from available fields
+    return _build_apa_citation(meta, meta.get("source_filename", "Unknown source"))
+
 # ---------------------------
 # UI Layout
 # ---------------------------
@@ -277,7 +313,7 @@ with st.sidebar:
         type=["pdf"], accept_multiple_files=True
     )
 
-    # Optional: sidecar JSON mapping filenames -> APA fields
+    # Optional: sidecar JSON mapping filenames -> APA fields (quick import)
     meta_sidecar = st.file_uploader(
         "Optional: metadata JSON (APA fields per filename)",
         type=["json"],
@@ -325,6 +361,8 @@ with st.sidebar:
                         "year": core.get("year"),
                         "title": core.get("title"),
                         "journal": user.get("apa_container"),  # for _build_apa_citation fallback
+                        # Note: when ingesting via this UI, we do not have filesystem pdf_path.
+                        # If you use the standalone ingest.py, it will store 'pdf_path' and 'apa' directly.
                     }
 
                     # Content-addressable IDs so re-ingesting is idempotent-ish
@@ -408,15 +446,27 @@ def format_context(ctx: List[Tuple[str, dict]]) -> str:
         lines.append(f"[{i}] ({src} • chunk {chunk})\n{doc}")
     return "\n\n".join(lines)
 
+# === UPDATED: build references via sidecar-first strategy ===
 def build_apa_sources_note(ctx: List[Tuple[str, dict]]) -> str:
     if not ctx:
         return ""
     apa_lines = []
+    seen_keys = set()
+
     for _, m in ctx:
-        apa = _build_apa_citation(m, m.get("source_filename", "Unknown source"))
-        apa_lines.append(apa)
+        # Dedup by strongest available key: pdf_path -> source_filename -> fallback apa text
+        key = m.get("pdf_path") or m.get("source_filename") or json.dumps(m, sort_keys=True)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        apa = _citation_from_meta(m)
+        if apa:
+            apa_lines.append(apa)
+
     apa_lines = _dedupe_preserve_order(apa_lines)
-    # Render as a newline list under "References"
+    if not apa_lines:
+        return ""
     return "\n\n**References**\n" + "\n".join(f"- {line}" for line in apa_lines)
 
 # ---------------------------
@@ -436,7 +486,7 @@ if prompt:
         ctx = retrieve(prompt, k=5)
         if ctx:
             context_block = format_context(ctx)  # model-visible
-            refs_block = build_apa_sources_note(ctx)  # reader-visible APA
+            refs_block = build_apa_sources_note(ctx)  # reader-visible APA (sidecar-first)
 
     # Build messages for Chat Completions
     sys_msg = st.session_state.messages[0]  # system
@@ -464,11 +514,16 @@ if prompt:
             except Exception as e:
                 answer = f"Error from model: {e}"
 
-            st.markdown(answer + (("\n\n" + refs_block) if refs_block else ""))
+            st.markdown(answer)
+
+            # Nicer UX: collapsible references
+            if refs_block:
+                with st.expander("References", expanded=False):
+                    st.markdown(refs_block)
+
     # add assistant msg
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer + (("\n\n" + refs_block) if refs_block else "")}
-    )
+    final_msg = answer + (("\n\n" + refs_block) if refs_block else "")
+    st.session_state.messages.append({"role": "assistant", "content": final_msg})
 
 # ---------------------------
 # Footer / tips
@@ -476,5 +531,5 @@ if prompt:
 st.markdown("---")
 st.caption(
     "Tip: Rotate the passcode from Streamlit **Secrets** when needed. "
-    "Documents you upload are stored in the app server's Chroma DB and never pushed to Git."
+    "If you ingest via the standalone script, per‑PDF sidecar metadata is read automatically for citations."
 )
