@@ -232,14 +232,16 @@ def main():
     parser.add_argument("--pattern", default="*.pdf", help="Glob pattern within PAPERS_DIR (default: *.pdf)")
     parser.add_argument("--dry-run", action="store_true", help="Parse and chunk, but don't write to Chroma")
     args = parser.parse_args()
-
+    
     ensure_dirs()
     collection = get_collection(rebuild=args.rebuild)
-
+    
+    # Always default to *.pdf if no pattern is given
     pdfs = sorted(PAPERS_DIR.glob(args.pattern))
     if not pdfs:
         print(f"No PDFs found in {PAPERS_DIR} matching {args.pattern}")
         sys.exit(0)
+
 
     print(f"Indexing {len(pdfs)} PDF(s) from {PAPERS_DIR} into collection '{TEXT_COLLECTION}'")
     results = []
