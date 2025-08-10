@@ -15,11 +15,36 @@ import json
 from typing import List, Tuple, Optional, Dict, Any
 import streamlit as st
 
-# --- images path ---
-LOGO_PATH = os.getenv("LOGO_PATH", "kelp_ark_logo.jpg")
-ICON_PATH = os.getenv("ICON_PATH", "ICON.png")
-# Configure page ASAP so favicon/title appear on auth screen too
-st.set_page_config(page_title="KelpGPT", page_icon=LOGO_PATH, layout="wide")
+# === Robust image resolution: files live next to app.py ===
+from pathlib import Path
+from PIL import Image
+
+ROOT = Path(__file__).parent.resolve()
+
+def _first_existing_local(*names: str) -> Optional[Path]:
+    for n in names:
+        if not n:
+            continue
+        p = (ROOT / n).resolve()
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+def _open_or_none(p: Optional[Path]):
+    if not p:
+        return None
+    try:
+        return Image.open(p)
+    except Exception:
+        return None
+
+# Your exact filenames (both in the same folder as app.py)
+LOGO_FILE = _first_existing_local("logo_icon.jpg")          # <- adjust if needed
+ICON_FILE = _first_existing_local("icon_kelp.png")          # <- adjust if needed
+
+# Configure page ASAP so favicon/title appear on auth screen too (use PIL or emoji fallback)
+page_icon_obj = _open_or_none(LOGO_FILE) or "🪸"
+st.set_page_config(page_title="KelpGPT", page_icon=page_icon_obj, layout="wide")
 
 # --- Local dev only: load .env if present (ignored in git) ---
 try:
@@ -230,9 +255,15 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
 with st.sidebar:
     # Try Streamlit's built-in logo helper (v1.31+), else fallback to image
     try:
-        st.logo(LOGO_PATH)
+        if LOGO_FILE:
+            st.logo(str(LOGO_FILE))
+        else:
+            st.write("KelpGPT")
     except Exception:
-        st.image(LOGO_PATH, use_container_width=True)
+        if LOGO_FILE:
+            st.image(str(LOGO_FILE), use_container_width=True)
+        else:
+            st.write("KelpGPT")
     st.header("KelpGPT")
     st.caption("Internal research assistant")
 
@@ -247,17 +278,6 @@ with st.sidebar:
     )
 
     # Optional: sidecar JSON mapping filenames -> APA fields
-    # Example schema:
-    # {
-    #   "Heat_Stress.pdf": {
-    #       "apa_authors": "Harden, M., ...",
-    #       "apa_year": "2025",
-    #       "apa_title": "Effects of heat stress on kelp physiology",
-    #       "apa_container": "Journal of Marine Science",
-    #       "apa_doi": "10.1234/abcd.2025.001",
-    #       "url": "https://example.org/heat_stress"
-    #   }
-    # }
     meta_sidecar = st.file_uploader(
         "Optional: metadata JSON (APA fields per filename)",
         type=["json"],
@@ -344,12 +364,16 @@ with left:
     st.markdown("## I'm KARA, how can I help you?")
     st.markdown("<h3 style='margin-top: -10px;'>KelpArk Research Assistant</h3>", unsafe_allow_html=True)
 with right:
-    st.image(LOGO_PATH, use_container_width=True)
+    if LOGO_FILE:
+        st.image(str(LOGO_FILE), use_container_width=True)
+
+# Preload assistant avatar (PIL image or emoji fallback)
+AVATAR_ASSISTANT = _open_or_none(ICON_FILE) or "🤖"
 
 # Render prior messages (user/assistant only) with avatars
 for m in st.session_state.messages:
     if m["role"] in ("user", "assistant"):
-        avatar = "🙂" if m["role"] == "user" else ICON_PATH
+        avatar = "🙂" if m["role"] == "user" else AVATAR_ASSISTANT
         with st.chat_message(m["role"], avatar=avatar):
             st.markdown(m["content"])
 
@@ -428,7 +452,7 @@ if prompt:
             convo_msgs.append(m)
 
     # Call OpenAI
-    with st.chat_message("assistant", avatar=ICON_PATH):
+    with st.chat_message("assistant", avatar=AVATAR_ASSISTANT):
         with st.spinner("Thinking…"):
             try:
                 resp = client.chat.completions.create(
