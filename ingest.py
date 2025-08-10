@@ -1,193 +1,87 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-KelpGPT Ingest (matches app.py embedding model)
+Created on Sun Aug 10 09:12:20 2025
 
-- Scans data/papers for PDFs by default (no args needed)
-- Creates/updates per-PDF sidecar JSON (via metadata.py)
-- Extracts text, chunks, embeds with OpenAI, stores in Chroma
+@author: hadfieldd
 """
 
-import os
-import sys
-import argparse
-from pathlib import Path
-from typing import List, Dict, Any, Tuple
-
-from tqdm import tqdm
+# ingest_cli.py
+import os, glob, hashlib
+from typing import List
 from pypdf import PdfReader
-import chromadb
 
-# === Config ===
+
+# load .env if present
 try:
-    import config
-    DATA_DIR = Path(getattr(config, "DATA_DIR", "data"))
-    PAPERS_DIR = Path(getattr(config, "PAPERS_DIR", DATA_DIR / "papers"))
-    CHROMA_PERSIST_DIR = Path(getattr(config, "CHROMA_PERSIST_DIR", "chroma_db"))
-    TEXT_COLLECTION = getattr(config, "TEXT_COLLECTION", "papers_text")
+    from dotenv import load_dotenv
+    load_dotenv()
 except Exception:
-    DATA_DIR = Path("data")
-    PAPERS_DIR = DATA_DIR / "papers"
-    CHROMA_PERSIST_DIR = Path("chroma_db")
-    TEXT_COLLECTION = "papers_text"
+    pass
 
-# === Metadata helper ===
-try:
-    from metadata import load_or_init, save_sidecar, ensure_reference_cache, sha256
-except ImportError:
-    print("ERROR: metadata.py not found. Please add it to your project.")
-    sys.exit(1)
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
+TEXT_COLLECTION    = os.getenv("TEXT_COLLECTION", "papers_text")
 
-# === OpenAI ===
-from openai import OpenAI
-_openai_client = OpenAI()
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY in env/.env")
 
-EMBED_MODEL = "text-embedding-3-small"  # matches app.py
-EMBED_DIM = 1536  # text-embedding-3-small output dimension
-
-# === Helpers ===
-def ensure_dirs():
-    PAPERS_DIR.mkdir(parents=True, exist_ok=True)
-    CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
-
-def read_pdf_pages(pdf_path: Path) -> List[str]:
-    reader = PdfReader(str(pdf_path))
-    pages = []
-    for page in reader.pages:
+def _extract_text(path: str) -> str:
+    reader = PdfReader(path)
+    out = []
+    for p in reader.pages:
         try:
-            text = page.extract_text() or ""
+            t = p.extract_text() or ""
         except Exception:
-            text = ""
-        pages.append(text.strip())
-    return pages
+            t = ""
+        if t: out.append(t)
+    return "\n\n".join(out)
 
-def simple_chunk(text: str, chunk_size: int = 1200, overlap: int = 120) -> List[str]:
-    chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(n, start + chunk_size)
-        chunks.append(text[start:end])
-        if end == n:
-            break
-        start = max(end - overlap, start + 1)
+def _chunk(text: str, size=1400, overlap=200) -> List[str]:
+    words = text.split()
+    chunks, i = [], 0
+    while i < len(words):
+        j = min(i + size, len(words))
+        chunks.append(" ".join(words[i:j]))
+        i = j - overlap if j - overlap > i else j
     return chunks
 
-def chunk_pdf_pages(pages: List[str],
-                    chunk_size: int = 1200,
-                    overlap: int = 120) -> List[Tuple[int, int, str]]:
-    out = []
-    for p, text in enumerate(pages, start=1):
-        if not text:
+def main(paths: List[str]):
+    import chromadb
+    from chromadb.utils import embedding_functions
+
+    ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=OPENAI_API_KEY,
+        model_name="text-embedding-3-small",
+    )
+    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    coll = client.get_or_create_collection(name=TEXT_COLLECTION, embedding_function=ef)
+
+    added = 0
+    for p in paths:
+        text = _extract_text(p)
+        if not text.strip():
+            print(f"Skip (no text): {p}")
             continue
-        parts = simple_chunk(text, chunk_size, overlap)
-        for part in parts:
-            out.append((p, p, part))
-    return out
-
-def embed_texts(batch: List[str]) -> List[List[float]]:
-    resp = _openai_client.embeddings.create(model=EMBED_MODEL, input=batch)
-    return [d.embedding for d in resp.data]
-
-def get_collection(rebuild: bool = False):
-    client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
-    if rebuild:
-        try:
-            client.delete_collection(TEXT_COLLECTION)
-        except Exception:
-            pass
-    return client.get_or_create_collection(name=TEXT_COLLECTION)
-
-def pdf_already_indexed(collection, doc_id: str, doc_hash: str) -> bool:
-    try:
-        res = collection.get(where={"doc_id": doc_id}, include=["metadatas"])
-        metas = res.get("metadatas", []) or []
-        return any(m.get("doc_hash") == doc_hash for m in metas)
-    except Exception:
-        return False
-
-def chunk_id(doc_id: str, page_start: int, page_end: int, idx: int) -> str:
-    return f"{doc_id}::p{page_start}-{page_end}::c{idx}"
-
-# === Main ingest logic ===
-def ingest_pdf(collection, pdf_path: Path, dry_run: bool = False) -> Dict[str, Any]:
-    meta = load_or_init(str(pdf_path))
-    meta = ensure_reference_cache(meta)
-    meta["pdf_path"] = str(pdf_path)
-    doc_hash = meta.get("hash") or sha256(str(pdf_path))
-    meta["hash"] = doc_hash
-    doc_id = meta["doc_id"]
-
-    if pdf_already_indexed(collection, doc_id, doc_hash):
-        return {"doc_id": doc_id, "status": "skip", "reason": "already indexed"}
-
-    pages = read_pdf_pages(pdf_path)
-    if not any(pages):
-        return {"doc_id": doc_id, "status": "warn", "reason": "no extractable text"}
-
-    chunks = chunk_pdf_pages(pages)
-    ids, docs, metas = [], [], []
-    for idx, (p0, p1, text) in enumerate(chunks):
-        ids.append(chunk_id(doc_id, p0, p1, idx))
-        docs.append(text)
-        metas.append({
-            "doc_id": doc_id,
-            "pdf_path": str(pdf_path),
-            "page_start": p0,
-            "page_end": p1,
-            "doc_hash": doc_hash,
-            "apa": meta.get("reference_style_cache", {}).get("apa"),
-        })
-
-    if dry_run:
-        return {"doc_id": doc_id, "status": "dry-run", "chunks": len(docs)}
-
-    # Embed in batches
-    BATCH = 64
-    for i in range(0, len(docs), BATCH):
-        vecs = embed_texts(docs[i:i+BATCH])
-        collection.add(
-            ids=ids[i:i+BATCH],
-            documents=docs[i:i+BATCH],
-            metadatas=metas[i:i+BATCH],
-            embeddings=vecs
-        )
-
-    save_sidecar(str(pdf_path), meta)
-    return {"doc_id": doc_id, "status": "ok", "chunks": len(docs)}
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--rebuild", action="store_true", help="Delete collection and reindex")
-    parser.add_argument("--pattern", default="*.pdf", help="Glob pattern within PAPERS_DIR (default: *.pdf)")
-    parser.add_argument("--dry-run", action="store_true", help="Parse and chunk, but don't write to Chroma")
-    args = parser.parse_args()
-
-    ensure_dirs()
-    collection = get_collection(rebuild=args.rebuild)
-
-    pdfs = sorted(PAPERS_DIR.glob(args.pattern))
-    if not pdfs:
-        print(f"No PDFs found in {PAPERS_DIR} matching {args.pattern}")
-        sys.exit(0)
-
-    print(f"Indexing {len(pdfs)} PDF(s) from {PAPERS_DIR} into collection '{TEXT_COLLECTION}'")
-    results = []
-    for pdf in tqdm(pdfs, desc="Ingesting"):
-        try:
-            out = ingest_pdf(collection, pdf, dry_run=args.dry_run)
-        except Exception as e:
-            out = {"doc_id": pdf.stem, "status": "error", "error": str(e)}
-        results.append(out)
-
-    ok = sum(1 for r in results if r["status"] == "ok")
-    skipped = sum(1 for r in results if r["status"] == "skip")
-    warn = sum(1 for r in results if r["status"] == "warn")
-    err = sum(1 for r in results if r["status"] == "error")
-
-    print(f"\nDone. ok={ok}, skipped={skipped}, warn={warn}, error={err}")
-    for r in results:
-        if r["status"] in ("warn", "error"):
-            print(f" - {r.get('doc_id')}: {r.get('status')} -> {r.get('reason') or r.get('error')}")
+        chunks = _chunk(text)
+        with open(p, "rb") as fh:
+            digest = hashlib.sha1(fh.read()).hexdigest()
+        ids = [f"{digest}-{i}" for i in range(len(chunks))]
+        metas = [{"filename": os.path.basename(p), "chunk": i} for i in range(len(chunks))]
+        coll.upsert(documents=chunks, ids=ids, metadatas=metas)
+        print(f"Ingested {len(chunks)} chunks from {p}")
+        added += len(chunks)
+    print(f"Done. Total chunks added: {added}")
 
 if __name__ == "__main__":
-    main()
+    import argparse, os
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inputs", nargs="+", help="PDF files or glob patterns")
+    args = ap.parse_args()
+
+    # expand globs on Windows too
+    files = []
+    for pat in args.inputs:
+        files.extend(glob.glob(pat))
+    if not files:
+        raise SystemExit("No matching PDFs found.")
+    main(files)
