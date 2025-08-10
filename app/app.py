@@ -39,8 +39,8 @@ def _open_or_none(p: Optional[Path]):
         return None
 
 # Your exact filenames (both in the same folder as app.py)
-LOGO_FILE = _first_existing_local("logo_icon.jpg")          # <- adjust if needed
-ICON_FILE = _first_existing_local("icon_kelp.png")          # <- adjust if needed
+LOGO_FILE = _first_existing_local("logo_icon.jpg")      # favicon + header + sidebar
+ICON_FILE = _first_existing_local("icon_kelp.png")      # assistant avatar
 
 # Configure page ASAP so favicon/title appear on auth screen too (use PIL or emoji fallback)
 page_icon_obj = _open_or_none(LOGO_FILE) or "🪸"
@@ -232,7 +232,7 @@ def _build_apa_citation(meta: Dict[str, Any], fallback_filename: str) -> str:
     if authors: parts.append(f"{authors}")
     if year:    parts.append(f"({year}).")
     if title:   parts.append(f"{title}.")
-    if journal: parts.append(f"*{journal}*.")
+    if journal: parts.append(f"*{journal}*.")  # italics in Markdown
     if doi:
         parts.append(f"https://doi.org/{doi}")
     elif url:
@@ -253,7 +253,7 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
 # UI Layout
 # ---------------------------
 with st.sidebar:
-    # Try Streamlit's built-in logo helper (v1.31+), else fallback to image
+    # Keep logo in sidebar
     try:
         if LOGO_FILE:
             st.logo(str(LOGO_FILE))
@@ -358,14 +358,14 @@ if "messages" not in st.session_state:
         {"role": "system", "content": "You are KelpGPT, a precise, helpful marine science research assistant. Cite sources if provided in context."}
     ]
 
-# --- Main header row (text left, logo right) ---
-left, right = st.columns([5, 1])
-with left:
+# --- Main header row: logo next to 'I'm KARA...' ---
+header_left, header_right = st.columns([1, 9])
+with header_left:
+    if LOGO_FILE:
+        st.image(str(LOGO_FILE), width=60)
+with header_right:
     st.markdown("## I'm KARA, how can I help you?")
     st.markdown("<h3 style='margin-top: -10px;'>KelpArk Research Assistant</h3>", unsafe_allow_html=True)
-with right:
-    if LOGO_FILE:
-        st.image(str(LOGO_FILE), use_container_width=True)
 
 # Preload assistant avatar (PIL image or emoji fallback)
 AVATAR_ASSISTANT = _open_or_none(ICON_FILE) or "🤖"
