@@ -1,10 +1,11 @@
 # app.py
 # Streamlit + Passcode Gate + RAG (Chroma) + Chat with OpenAI
 # ---------------------------------------------------------------
-# - Uses OpenAI embeddings (1536-dim) to match ingest.py
-# - Kelp Ark logo: favicon + top-right header + sidebar
-# - Assistant avatar: kelp icon; User avatar: test tube icon
-# - Optional upload + ingest inside the app
+# - Layout matches the "old" format: RAG toggle + Upload + Model/Temp in sidebar
+# - Uses OpenAI embeddings (default: text-embedding-3-small, 1536-dim)
+# - Avatars: assistant = kelp icon, user = test-tube icon
+# - Metadata-aware retrieval: if the user hints an author/title (e.g., "Jose"),
+#   we first filter by metadata (paper_title/authors), then do semantic ranking.
 # ---------------------------------------------------------------
 
 import os
@@ -13,19 +14,15 @@ import re
 import time
 import json
 import base64
+import unicodedata
 from typing import List, Tuple, Optional, Dict, Any
 
 import streamlit as st
 from pathlib import Path
-from PIL import Image
-from textwrap import dedent
 
-# ---------- Paths & Helpers ----------
+# ---------- Page setup early (favicon/title on auth screen too) ----------
 ROOT = Path(__file__).parent.resolve()
 
-# ---------------------------
-# Image helpers
-# ---------------------------
 def _first_existing_local(*names: str) -> Optional[Path]:
     for n in names:
         if not n:
@@ -35,27 +32,13 @@ def _first_existing_local(*names: str) -> Optional[Path]:
             return p
     return None
 
-def _to_data_uri(p: Optional[Path]) -> Optional[str]:
-    if not p:
-        return None
-    try:
-        raw = p.read_bytes()
-        ext = p.suffix.lower()
-        mime = "image/png" if ext == ".png" else "image/jpeg"
-        b64 = base64.b64encode(raw).decode("utf-8")
-        return f"data:{mime};base64,{b64}"
-    except Exception:
-        return None
-
-# Image files in SAME folder as app.py
 LOGO_FILE = _first_existing_local("logo_icon.png","logo_icon.jpg","kelp_ark_logo.png","kelp_ark_logo.jpg")
 ASSISTANT_ICON_FILE = _first_existing_local("icon_kelp.png","icon_kelp.jpg","kelp_icon.png","kelp_icon.jpg","model_avatar.png")
 USER_ICON_FILE      = _first_existing_local("test_tube.png","test_tube.jpg","icon_test_tube.png","icon_test_tube.jpg","user_model.png")
 
-# Configure page EARLY so favicon shows on auth page too
 st.set_page_config(page_title="KelpGPT", page_icon=(str(LOGO_FILE) if LOGO_FILE else "🪸"), layout="wide")
 
-# --- Local dev only: load .env if present (ignored in git) ---
+# --- Local dev only: load .env if present ---
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -93,6 +76,9 @@ if "attempts" not in st.session_state: st.session_state.attempts = 0
 if "lockout_until" not in st.session_state: st.session_state.lockout_until = 0
 if "auth_time" not in st.session_state: st.session_state.auth_time = 0
 if "messages" not in st.session_state: st.session_state.messages = []
+if "use_rag" not in st.session_state: st.session_state.use_rag = True
+if "model" not in st.session_state: st.session_state.model = "gpt-4o-mini"
+if "temperature" not in st.session_state: st.session_state.temperature = 0.3
 
 def require_auth() -> bool:
     now = time.time()
@@ -141,7 +127,7 @@ if not require_auth():
 from openai import OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- Chroma (matches ingest.py) ----------
+# ---------- Chroma (modern API, matches ingest.py) ----------
 import chromadb
 from chromadb.utils import embedding_functions
 
@@ -149,10 +135,14 @@ from chromadb.utils import embedding_functions
 def _get_chroma():
     ef = embedding_functions.OpenAIEmbeddingFunction(
         api_key=OPENAI_API_KEY,
-        model_name=EMBED_MODEL,  # keep in sync with ingest.py
+        model_name=EMBED_MODEL,
     )
     cli = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-    col = cli.get_or_create_collection(name=TEXT_COLLECTION, metadata={"embedding_model": EMBED_MODEL}, embedding_function=ef)
+    col = cli.get_or_create_collection(
+        name=TEXT_COLLECTION,
+        metadata={"embedding_model": EMBED_MODEL},
+        embedding_function=ef
+    )
     return cli, col
 
 def _get_collection():
@@ -163,7 +153,7 @@ def _get_collection():
         st.warning(f"RAG not available: {e}")
         return None
 
-# ---------- PDF helpers / APA ----------
+# ---------- PDF helpers ----------
 def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> List[str]:
     words = text.split()
     chunks: List[str] = []
@@ -184,9 +174,8 @@ def _extract_pdf_core_metadata(file_bytes: bytes) -> Dict[str, Any]:
         a = str(info.get("/Author","") or info.get("Author","") or "").strip()
         y = str(info.get("/CreationDate","") or info.get("CreationDate","") or "")
         year = None
-        m = re.search(r"D:\d{4}", y) or re.search(r"\b(19|20)\d{2}\b", y)
-        if m:
-            year = re.search(r"(19|20)\d{2}", m.group(0)).group(0)
+        m = re.search(r"(19|20)\d{2}", y)
+        if m: year = m.group(0)
         meta.update({"title": t or None, "authors": a or None, "year": year})
     except Exception:
         pass
@@ -212,8 +201,8 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
             seen.add(x); out.append(x)
     return out
 
+# ---------- APA refs ----------
 def _build_apa_line(meta: Dict[str, Any], fallback_filename: str) -> str:
-    # Prefer ingest.py keys, then inline-app ingest keys
     authors = meta.get("authors")
     title   = meta.get("paper_title") or meta.get("title")
     year    = meta.get("year")
@@ -233,8 +222,52 @@ def build_apa_sources_note(ctx: List[Tuple[str, dict]]) -> str:
     apa_lines = _dedupe_preserve_order(apa_lines)
     return "\n\n**References**\n" + "\n".join(apa_lines) if apa_lines else ""
 
-# ---------- Sidebar ----------
+# ---------- Metadata-aware retrieval helpers ----------
+def _norm(s: Optional[str]) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    return s.lower().strip()
+
+def _extract_paper_hints(user_text: str) -> List[str]:
+    t = _norm(user_text)
+    hints: List[str] = []
+    # quoted titles
+    for q in re.findall(r"['\"]([^'\"]{3,80})['\"]", user_text):
+        hints.append(_norm(q))
+    tokens = re.findall(r"[a-zA-Z]{3,}", t)
+    stop = {"paper","papers","about","the","and","from","study","article","report","figure","figures","seaweed","kelp","ulva","growth","what","know","joses"}
+    for tok in tokens:
+        if tok not in stop and 3 <= len(tok) <= 18:
+            hints.append(tok)
+    seen = set(); out=[]
+    for h in hints:
+        if h not in seen:
+            seen.add(h); out.append(h)
+    return out[:3]
+
+def _candidate_doc_ids_by_metadata(collection, hints: List[str], limit_docs: int = 30) -> List[str]:
+    got = collection.get(include=["metadatas"], limit=5000)
+    metas = (got or {}).get("metadatas") or []
+    doc_ids = []
+    seen = set()
+    for m in metas:
+        title = _norm(m.get("paper_title") or m.get("title"))
+        authors = _norm(m.get("authors"))
+        doc_id = m.get("doc_id")
+        if not doc_id:
+            continue
+        hay = f"{title} || {authors}"
+        if any(h in hay for h in hints):
+            if doc_id not in seen:
+                seen.add(doc_id)
+                doc_ids.append(doc_id)
+                if len(doc_ids) >= limit_docs:
+                    break
+    return doc_ids
+
+# ---------- Sidebar (old layout) ----------
 with st.sidebar:
+    # Logo
     try:
         if LOGO_FILE:
             st.logo(str(LOGO_FILE))
@@ -246,45 +279,52 @@ with st.sidebar:
         else:
             st.write("KelpGPT")
 
+    st.toggle("Use document retrieval (RAG)", value=st.session_state.use_rag, key="use_rag", help="Turn off to chat without pulling from your PDFs.")
+
+    st.markdown("### Upload PDFs (optional)")
+    up_files = st.file_uploader("Add PDFs to the local index (Chroma).", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed")
+    meta_sidecar = st.file_uploader("Optional: metadata JSON (APA fields per filename)", type=["json"])
+    ingest_click = st.button("Ingest PDFs")
+
+    st.markdown("---")
+    st.markdown("### Model")
+    model = st.selectbox(" ", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=["gpt-4o-mini","gpt-4o","gpt-4.1-mini"].index(st.session_state.model), label_visibility="collapsed")
+    st.session_state.model = model
+    st.write("")  # spacing
+    st.write("Creativity (temperature)")
+    temperature = st.slider("", 0.0, 1.2, float(st.session_state.temperature), 0.1, label_visibility="collapsed")
+    st.session_state.temperature = temperature
+
+# ---------- Main header ----------
 st.header("KelpGPT")
 st.caption("Internal research assistant")
-st.markdown("---")
 
-# Model + temperature controls
-model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
-st.session_state["model"] = model
-temperature = st.slider("Creativity (temperature)", 0.0, 1.2, 0.3, 0.1)
-st.session_state["temperature"] = temperature
-
-# ---------- Top header (logo on right) ----------
-left, right = st.columns([1, 0.12])
-with left:
+# Right-aligned logo
+col_left, col_right = st.columns([1, 0.12])
+with col_left:
     st.markdown(
         "<div style='font-size:22px;font-weight:600;line-height:1.1;'>I'm KARA, how can I help you?</div>"
         "<div style='margin-top:2px;color:#8a8a8a;'>KelpArk Research Assistant</div>",
         unsafe_allow_html=True
     )
-with right:
+with col_right:
     if LOGO_FILE:
         st.image(str(LOGO_FILE), width=64)
 
-# ---------- RAG sanity ----------
-try:
-    col_probe = _get_collection()
-    if col_probe is not None:
-        st.info(f"RAG online. Collection '{TEXT_COLLECTION}' contains ~{col_probe.count()} chunks.")
-    else:
-        st.warning("RAG not available.")
-except Exception as e:
-    st.warning(f"RAG not available: {e}")
+# ---------- RAG status banner ----------
+collection_for_status = _get_collection()
+if collection_for_status is not None:
+    try:
+        st.info(f"RAG online. Collection '{TEXT_COLLECTION}' contains ~{collection_for_status.count()} chunks.")
+    except Exception:
+        st.info(f"RAG online. Collection '{TEXT_COLLECTION}' is available.")
+else:
+    st.warning("RAG not available.")
 
-# ---------- Upload & Ingest (optional inside app) ----------
 st.markdown("---")
-st.subheader("📥 Upload PDFs (optional)")
-up_files = st.file_uploader("Add PDFs to the local index (Chroma).", type=["pdf"], accept_multiple_files=True)
-meta_sidecar = st.file_uploader("Optional: metadata JSON (APA fields per filename)", type=["json"])
 
-if st.button("Ingest PDFs"):
+# ---------- Ingest (from sidebar button) ----------
+if ingest_click:
     if not up_files:
         st.warning("No PDFs selected.")
     else:
@@ -349,13 +389,33 @@ def retrieve(query: str, k: int = 5) -> List[Tuple[str, dict]]:
     collection = _get_collection()
     if collection is None:
         return []
-    res = collection.query(query_texts=[query], n_results=k)
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    return list(zip(docs, metas))
 
-# ---------- Chat submit ----------
-prompt = st.chat_input("Ask something…")
+    # 1) Try metadata-guided narrowing (author/title hints)
+    hints = _extract_paper_hints(query)
+    docs: List[str] = []
+    metas: List[dict] = []
+
+    if hints:
+        try:
+            doc_ids = _candidate_doc_ids_by_metadata(collection, hints)
+            if doc_ids:
+                res = collection.query(
+                    query_texts=[query],
+                    n_results=k,
+                    where={"doc_id": {"$in": doc_ids}},
+                )
+                docs = res.get("documents", [[]])[0]
+                metas = res.get("metadatas", [[]])[0]
+        except Exception:
+            pass  # fall back
+
+    # 2) Normal semantic retrieval if nothing matched
+    if not docs:
+        res = collection.query(query_texts=[query], n_results=k)
+        docs = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+
+    return list(zip(docs, metas))
 
 def _build_context_block(ctx: List[Tuple[str, dict]]) -> str:
     if not ctx:
@@ -368,15 +428,20 @@ def _build_context_block(ctx: List[Tuple[str, dict]]) -> str:
         lines.append("")
     return "\n".join(lines).strip()
 
+# ---------- Chat submit ----------
+prompt = st.chat_input("Ask something…")
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar=AVATAR_USER):
         st.markdown(prompt)
 
-    # Retrieve
-    ctx = retrieve(prompt, k=6)
-    context_block = _build_context_block(ctx)
-    refs_block = build_apa_sources_note(ctx)
+    ctx: List[Tuple[str, dict]] = []
+    refs_block = ""
+    if st.session_state.use_rag:
+        ctx = retrieve(prompt, k=6)
+        refs_block = build_apa_sources_note(ctx)
+
+    context_block = _build_context_block(ctx) if ctx else ""
 
     # Build conversation payload
     convo_msgs = []
@@ -384,9 +449,9 @@ if prompt:
         "role": "system",
         "content": (
             "You are KelpGPT, a marine science research assistant for Kelp Ark. "
-            "Prefer information from the provided context. If the user asks about a specific paper (e.g., 'Jose's paper'), "
-            "answer primarily from the most relevant chunks whose metadata paper_title matches. "
-            "Be concise and factual. If context is missing, say so and proceed with best knowledge."
+            "Prefer information from the provided context. If the user asks about a specific paper "
+            "(e.g., 'Jose's paper'), answer primarily from chunks whose metadata (paper_title/authors) match. "
+            "If context is missing, say so briefly and proceed with best knowledge."
         )
     })
     if context_block:
@@ -394,7 +459,8 @@ if prompt:
             "role": "system",
             "content": f"Context (top-k retrieved, cite by paper title in a References section):\n\n{context_block}"
         })
-    # include prior turns for style continuity (no contexts)
+
+    # include prior turns for continuity
     for m in st.session_state.messages:
         if m["role"] in ("user", "assistant"):
             convo_msgs.append(m)
@@ -403,9 +469,9 @@ if prompt:
         with st.spinner("Thinking…"):
             try:
                 resp = client.chat.completions.create(
-                    model=st.session_state["model"],
+                    model=st.session_state.model,
                     messages=convo_msgs,
-                    temperature=st.session_state["temperature"],
+                    temperature=st.session_state.temperature,
                 )
                 answer = resp.choices[0].message.content
             except Exception as e:
