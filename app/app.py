@@ -1,380 +1,274 @@
 # app.py
-# Streamlit + Passcode Gate + RAG (Chroma) + Chat with OpenAI
 # ---------------------------------------------------------------
-# - Uses OpenAI embeddings (1536-dim) to match ingest.py
-# - Kelp Ark logo: favicon + top-right header + sidebar
-# - Assistant avatar: kelp icon; User avatar: test tube icon
-# - Optional upload + ingest inside the app
+# Streamlit + Passcode Gate + Optional RAG (Chroma) + Chat with OpenAI
+# - Prioritizes matches to paper_title/authors (e.g., "Jose's paper")
+# - Citations show human-readable paper titles (not filenames)
+# - Windows-safe paths and environment handling
 # ---------------------------------------------------------------
 
 import os
-import io
 import re
-import time
 import json
-from typing import List, Tuple, Optional, Dict, Any
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
 
 import streamlit as st
-from pathlib import Path
-from PIL import Image
 
-# ---------- Paths & Helpers ----------
-ROOT = Path(__file__).parent.resolve()
+# --- Images next to app.py (Windows-safe) ---
+LOGO_PATH = os.getenv("LOGO_PATH", "logo_icon.jpg")
+ICON_PATH = os.getenv("ICON_PATH", "icon.jpg")  # can be .png/.jpg as long as file exists
 
-def _first_existing_local(*names: str) -> Optional[Path]:
-    for n in names:
-        if not n:
-            continue
-        p = (ROOT / n).resolve()
-        if p.exists() and p.is_file():
-            return p
-    return None
+st.set_page_config(page_title="KelpGPT", page_icon=LOGO_PATH, layout="wide")
 
-# Image files in SAME folder as app.py
-LOGO_FILE = _first_existing_local("kelp_ark_logo.png","logo_icon.jpg","kelp_ark_logo.png","kelp_ark_logo.jpg")
-ASSISTANT_ICON_FILE = _first_existing_local("model_avatar.png","icon_kelp.jpg","kelp_icon.png","kelp_icon.jpg")
-USER_ICON_FILE      = _first_existing_local("user_model.png","test_tube.jpg","icon_test_tube.png","icon_test_tube.jpg")
-
-# Configure page EARLY so favicon shows on auth page too
-st.set_page_config(page_title="KelpGPT", page_icon=(str(LOGO_FILE) if LOGO_FILE else "🪸"), layout="wide")
-
-# --- Local dev only: load .env if present (ignored in git) ---
+# --- Local dev only: load .env if present ---
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# ---------- Secrets / Config ----------
-def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+from chromadb import Client
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+
+# ---- OpenAI (Responses + Embeddings) ----
+from openai import OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+assert OPENAI_API_KEY, "OPENAI_API_KEY is not set"
+
+client_oa = OpenAI(api_key=OPENAI_API_KEY)
+
+# ---- Chroma settings ----
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
+TEXT_COLLECTION    = os.getenv("TEXT_COLLECTION", "papers_text")
+EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-large")  # must match ingest
+RAG_TOP_K          = int(os.getenv("RAG_TOP_K", "6"))
+
+# ---- Access Gate ----
+APP_PASSCODE = os.getenv("APP_PASSCODE", "")
+
+# ---- UI Helpers ----
+def _file_exists(p: str) -> bool:
     try:
-        v = st.secrets.get(name)
-        return v if v is not None else os.getenv(name, default)
+        return Path(p).is_file()
     except Exception:
-        return os.getenv(name, default)
+        return False
 
-OPENAI_API_KEY     = _get_secret("OPENAI_API_KEY")
-APP_PASSCODE       = _get_secret("APP_PASSCODE")
-CHROMA_PERSIST_DIR = _get_secret("CHROMA_PERSIST_DIR", "chroma_db")
-TEXT_COLLECTION    = _get_secret("TEXT_COLLECTION", "papers_text")
+def _first_existing(*names: str) -> str:
+    for n in names:
+        if n and _file_exists(n):
+            return n
+    return ""
 
-if not OPENAI_API_KEY:
-    st.error("Server missing OPENAI_API_KEY.")
-    st.stop()
-if not APP_PASSCODE:
-    st.error("Server missing APP_PASSCODE.")
-    st.stop()
+# ---- Chroma (lazy init) ----
+@st.cache_resource(show_spinner=False)
+def _chroma_and_collection():
+    chroma = Client(Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory=CHROMA_PERSIST_DIR,
+    ))
+    # Attach the same embedding function used at creation
+    ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=OPENAI_API_KEY,
+        model_name=EMBED_MODEL
+    )
+    coll = chroma.get_or_create_collection(
+        name=TEXT_COLLECTION,
+        metadata={"embedding_model": EMBED_MODEL},
+        embedding_function=ef
+    )
+    # Guard against model mismatch
+    meta = coll.metadata or {}
+    used = meta.get("embedding_model", "")
+    if used and used != EMBED_MODEL:
+        st.error(
+            f"Chroma collection '{TEXT_COLLECTION}' was created with '{used}', "
+            f"but this app is configured for '{EMBED_MODEL}'. "
+            f"Delete the folder '{CHROMA_PERSIST_DIR}' or reconfigure EMBED_MODEL."
+        )
+    return chroma, coll
 
-# ---------- Auth Gate ----------
-ATTEMPT_LIMIT = 5
-LOCKOUT_SECS  = 120
-SESSION_TTL   = 60 * 60  # 1 hour
+# ---- Retrieval & Re-ranking ----
+def _simple_normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip().lower()
 
-if "authed" not in st.session_state: st.session_state.authed = False
-if "attempts" not in st.session_state: st.session_state.attempts = 0
-if "lockout_until" not in st.session_state: st.session_state.lockout_until = 0.0
-if "auth_time" not in st.session_state: st.session_state.auth_time = 0.0
+def boost_score(query: str, meta: Dict[str, Any], base_dist: float) -> float:
+    """
+    Chroma returns cosine distance (smaller = better).
+    We transform to a score and apply boosts when the query matches paper_title/authors.
+    """
+    q = _simple_normalize(query)
+    title = _simple_normalize(meta.get("paper_title", ""))
+    authors = _simple_normalize(meta.get("authors", ""))
+    fname = _simple_normalize(meta.get("file_name", ""))
 
-def require_auth() -> bool:
-    now = time.time()
+    # Convert distance to a base score
+    base_score = 1.0 / (1.0 + max(base_dist, 1e-6))
 
-    if st.session_state.authed and (now - st.session_state.auth_time > SESSION_TTL):
+    boost = 1.0
+    # Prioritize exact-ish hits (e.g., "jose", "cruz-burgos", actual title words)
+    if any(tok and tok in title for tok in q.split()):
+        boost *= 1.5
+    if any(tok and tok in authors for tok in q.split()):
+        boost *= 1.4
+    # If user literally mentioned the filename, give a small nudge
+    if any(tok and tok in fname for tok in q.split()):
+        boost *= 1.1
+
+    return base_score * boost
+
+def retrieve_with_boost(query: str, k: int = RAG_TOP_K) -> List[Dict[str, Any]]:
+    """
+    Query Chroma and re-rank by metadata/title/author match so that
+    'Jose's paper' pulls from that document first.
+    """
+    _, coll = _chroma_and_collection()
+    if coll.count() == 0:
+        return []
+
+    try:
+        res = coll.query(query_texts=[query], n_results=max(k * 2, 8), include=["distances", "metadatas", "documents"])
+    except Exception as e:
+        st.warning(f"RAG not available: {e}")
+        return []
+
+    results = []
+    dists = (res.get("distances") or [[]])[0]
+    docs = (res.get("documents") or [[]])[0]
+    metas = (res.get("metadatas") or [[]])[0]
+
+    for doc, meta, dist in zip(docs, metas, dists):
+        score = boost_score(query, meta, dist)
+        results.append({
+            "text": doc,
+            "meta": meta,
+            "dist": float(dist),
+            "score": float(score),
+        })
+
+    # sort by boosted score (high -> low)
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:k]
+
+def build_context_and_citations(results: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
+    """Combine top chunks and collect unique paper titles for display."""
+    context_parts = []
+    titles = []
+    seen_docs = set()
+    for r in results:
+        context_parts.append(r["text"])
+        t = r["meta"].get("paper_title") or r["meta"].get("file_name")
+        if t and t not in titles:
+            titles.append(t)
+        # keep 1-2 chunks per doc to avoid swamping
+        did = r["meta"].get("doc_id")
+        if did:
+            seen_docs.add(did)
+        if len(context_parts) >= 6:
+            break
+    return "\n\n---\n\n".join(context_parts), titles
+
+# ---- OpenAI chat call ----
+def chat_with_openai(prompt: str, system: str) -> str:
+    resp = client_oa.chat.completions.create(
+        model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
+
+# ---- UI ----
+def auth_gate() -> bool:
+    if not APP_PASSCODE:
+        return True
+    if "authed" not in st.session_state:
         st.session_state.authed = False
-
     if st.session_state.authed:
         return True
 
-    if now < st.session_state.lockout_until:
-        remaining = int(st.session_state.lockout_until - now)
-        st.title("🔒 Team Access")
-        st.warning(f"Too many attempts. Try again in {remaining} seconds.")
+    with st.sidebar:
+        st.subheader("🔐 Team Access")
+        code = st.text_input("Enter passcode", type="password")
+        if st.button("Unlock"):
+            if code == APP_PASSCODE:
+                st.session_state.authed = True
+                st.success("Access granted")
+            else:
+                st.error("Incorrect code")
+    return st.session_state.authed
+
+def main():
+    st.sidebar.image(_first_existing(LOGO_PATH), width=140)
+    st.sidebar.markdown("### KelpGPT – Research Assistant")
+    use_rag = st.sidebar.toggle("Use local RAG (Chroma)", value=True)
+    st.sidebar.caption(f"DB: `{Path(CHROMA_PERSIST_DIR).resolve()}`")
+
+    st.title("KelpGPT")
+    st.write("Ask about **specific papers** (e.g., *Jose’s paper*) or general topics. "
+             "When RAG is on, answers prioritize your ingested PDFs.")
+
+    if not auth_gate():
         st.stop()
 
-    st.title("🔒 Team Access")
-    st.caption("Enter the 4‑digit passcode to use KelpGPT.")
+    if "history" not in st.session_state:
+        st.session_state.history = []
 
-    col1, col2 = st.columns([3,1])
-    with col1:
-        code = st.text_input("Passcode", type="password", max_chars=4, help="Ask Dylan for the current code.")
-    with col2:
-        login = st.button("Unlock", use_container_width=True)
+    # Chat input
+    user_msg = st.chat_input("Ask me anything about your papers…")
+    if user_msg:
+        st.session_state.history.append(("user", user_msg))
 
-    if login:
-        if code == APP_PASSCODE:
-            st.session_state.authed = True
-            st.session_state.auth_time = now
-            st.session_state.attempts = 0
-            return True
-        else:
-            st.session_state.attempts += 1
-            if st.session_state.attempts >= ATTEMPT_LIMIT:
-                st.session_state.lockout_until = now + LOCKOUT_SECS
-                st.error("Too many incorrect attempts. Temporarily locked.")
-            else:
-                left = ATTEMPT_LIMIT - st.session_state.attempts
-                st.error(f"Incorrect passcode. {left} attempt(s) left.")
-            st.stop()
+        retrieved = []
+        citations = []
+        context = ""
+        if use_rag:
+            retrieved = retrieve_with_boost(user_msg, RAG_TOP_K)
+            if retrieved:
+                context, citations = build_context_and_citations(retrieved)
 
-    st.stop()
+        # Build the system prompt
+        sys_prompt = (
+            "You are KelpGPT, a marine science research assistant. "
+            "If context is provided, answer **primarily** from it. "
+            "Cite papers at the end as a bulleted list using the paper titles from metadata. "
+            "Only bring in general knowledge if the context is insufficient, and say so."
+        )
 
-if not require_auth():
-    st.stop()
+        final_prompt = user_msg
+        if context:
+            final_prompt = (
+                "Use the following document context first.\n\n"
+                f"### CONTEXT START\n{context}\n### CONTEXT END\n\n"
+                f"Question: {user_msg}"
+            )
 
-# ---------- OpenAI client ----------
-from openai import OpenAI
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ---------- Chroma (matches ingest.py: OpenAI 1536-dim) ----------
-@st.cache_resource(show_spinner=False)
-def _get_chroma():
-    import chromadb
-    from chromadb.utils import embedding_functions
-
-    ef = embedding_functions.OpenAIEmbeddingFunction(
-        api_key=OPENAI_API_KEY,
-        model_name="text-embedding-3-small",  # 1536-dim
-    )
-    cli = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-    col = cli.get_or_create_collection(name=TEXT_COLLECTION, embedding_function=ef)
-    return cli, col
-
-# ---------- PDF helpers / APA ----------
-def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> List[str]:
-    words = text.split()
-    chunks = []
-    i = 0
-    while i < len(words):
-        j = min(i + chunk_size, len(words))
-        chunks.append(" ".join(words[i:j]))
-        i = j - overlap if j - overlap > i else j
-    return chunks
-
-def _parse_pdf_year(raw_date: Optional[str]) -> Optional[str]:
-    if not raw_date:
-        return None
-    m = re.search(r"(19|20)\d{2}", raw_date)
-    return m.group(0) if m else None
-
-def _extract_pdf_core_metadata(file_bytes: bytes) -> Dict[str, Any]:
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(file_bytes))
-        md = reader.metadata or {}
-        title = (getattr(md, "title", None) or md.get("/Title") or "").strip() or None
-        authors = (getattr(md, "author", None) or md.get("/Author") or "").strip() or None
-        year = _parse_pdf_year(getattr(md, "creation_date", None) or md.get("/CreationDate"))
-        return {"title": title, "authors": authors, "year": year}
-    except Exception:
-        return {"title": None, "authors": None, "year": None}
-
-def _build_apa_citation(meta: Dict[str, Any], fallback_filename: str) -> str:
-    authors = meta.get("authors")
-    year    = meta.get("year")
-    title   = meta.get("title")
-    if not (authors or title):
-        return fallback_filename
-    parts = []
-    if authors: parts.append(f"{authors}")
-    if year:    parts.append(f"({year}).")
-    if title:   parts.append(f"{title}.")
-    return " ".join(parts).strip()
-
-def _dedupe_preserve_order(items: List[str]) -> List[str]:
-    seen, out = set(), []
-    for x in items:
-        if x not in seen:
-            seen.add(x); out.append(x)
-    return out
-
-# ---------- Sidebar ----------
-with st.sidebar:
-    if LOGO_FILE:
-        st.logo(str(LOGO_FILE))
-    else:
-        st.write("KelpGPT")
-
-    st.header("KelpGPT")
-    st.caption("Internal research assistant")
-
-    use_rag = st.toggle("Use document retrieval (RAG)", value=True,
-                        help="Search your uploaded/ingested PDFs for relevant context.")
-    st.session_state["use_rag"] = use_rag
-
-    st.markdown("---")
-    st.subheader("📥 Upload PDFs (optional)")
-    up_files = st.file_uploader("Add PDFs to the local index (Chroma).", type=["pdf"], accept_multiple_files=True)
-
-    if st.button("Ingest PDFs"):
-        if not up_files:
-            st.warning("No PDFs selected.")
-        else:
-            with st.spinner("Ingesting…"):
-                _, collection = _get_chroma()
-                add_count = 0
-                for f in up_files:
-                    raw = f.read()
-                    # Extract text
-                    try:
-                        from pypdf import PdfReader
-                        reader = PdfReader(io.BytesIO(raw))
-                        texts = []
-                        for page in reader.pages:
-                            try:
-                                t = page.extract_text() or ""
-                            except Exception:
-                                t = ""
-                            if t: texts.append(t)
-                        text = "\n\n".join(texts)
-                    except Exception:
-                        text = ""
-                    if not text.strip():
-                        continue
-                    chunks = _chunk_text(text)
-
-                    # Minimal metadata
-                    core = _extract_pdf_core_metadata(raw)
-                    base_meta = {
-                        "source_filename": f.name,
-                        "authors": core.get("authors"),
-                        "year": core.get("year"),
-                        "title": core.get("title"),
-                    }
-
-                    # Content-addressable IDs
-                    import hashlib
-                    digest = hashlib.sha1(raw).hexdigest()
-                    ids = [f"{digest}-{i}" for i in range(len(chunks))]
-                    metadatas = []
-                    for i in range(len(chunks)):
-                        m = dict(base_meta)
-                        m["chunk"] = i
-                        metadatas.append(m)
-
-                    collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
-                    add_count += len(chunks)
-
-                st.success(f"Ingested {add_count} chunks.")
-
-    st.markdown("---")
-    model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
-    st.session_state["model"] = model
-    temperature = st.slider("Creativity (temperature)", 0.0, 1.2, 0.3, 0.1)
-    st.session_state["temperature"] = temperature
-
-# ---------- Top header (logo right) ----------
-left, right = st.columns([1, 0.12])
-with left:
-    st.markdown(
-        "<div style='font-size:22px;font-weight:600;line-height:1.1;'>I'm KARA, how can I help you?</div>"
-        "<div style='margin-top:2px;color:#8a8a8a;'>KelpArk Research Assistant</div>",
-        unsafe_allow_html=True
-    )
-with right:
-    if LOGO_FILE:
-        st.image(str(LOGO_FILE), width=64)
-
-# ---------- RAG sanity ----------
-try:
-    _, _col = _get_chroma()
-    st.info(f"RAG online. Collection '{TEXT_COLLECTION}' contains ~{_col.count()} chunks.")
-except Exception as e:
-    st.warning(f"RAG not available: {e}")
-
-# ---------- Avatars + history ----------
-AVATAR_ASSISTANT = (str(ASSISTANT_ICON_FILE) if ASSISTANT_ICON_FILE else "🪸")
-AVATAR_USER      = (str(USER_ICON_FILE)      if USER_ICON_FILE      else "🧪")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "system", "content": "You are KelpGPT, a precise, helpful marine science research assistant. Cite sources if provided in context."}
-    ]
-
-for m in st.session_state.messages:
-    if m["role"] in ("user", "assistant"):
-        avatar = AVATAR_USER if m["role"] == "user" else AVATAR_ASSISTANT
-        with st.chat_message(m["role"], avatar=avatar):
-            st.markdown(m["content"])
-
-# ---------- Retrieval ----------
-def _get_collection():
-    try:
-        _, collection = _get_chroma()
-        return collection
-    except Exception as e:
-        st.warning(f"RAG not available: {e}")
-        return None
-
-def retrieve(query: str, k: int = 5) -> List[Tuple[str, dict]]:
-    collection = _get_collection()
-    if collection is None:
-        return []
-    res = collection.query(query_texts=[query], n_results=k)
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    return list(zip(docs, metas))
-
-def format_context(ctx: List[Tuple[str, dict]]) -> str:
-    if not ctx:
-        return ""
-    lines = []
-    for i, (doc, meta) in enumerate(ctx, 1):
-        src = meta.get("source_filename", "doc")
-        chunk = meta.get("chunk", i)
-        lines.append(f"[{i}] ({src} • chunk {chunk})\n{doc}")
-    return "\n\n".join(lines)
-
-def build_apa_sources_note(ctx: List[Tuple[str, dict]]) -> str:
-    if not ctx:
-        return ""
-    apa_lines = []
-    for _, m in ctx:
-        apa = _build_apa_citation(m, m.get("source_filename", "Unknown source"))
-        apa_lines.append(apa)
-    apa_lines = _dedupe_preserve_order(apa_lines)
-    return "\n\n**References**\n" + "\n".join(f"- {line}" for line in apa_lines)
-
-# ---------- Chat submit ----------
-prompt = st.chat_input("Ask something…")
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user", avatar=AVATAR_USER):
-        st.markdown(prompt)
-
-    context_block = ""
-    refs_block = ""
-    if st.session_state.get("use_rag", True):
-        ctx = retrieve(prompt, k=5)
-        if ctx:
-            context_block = format_context(ctx)
-            refs_block = build_apa_sources_note(ctx)
-
-    sys_msg = st.session_state.messages[0]
-    convo_msgs = [{"role": "system", "content": sys_msg["content"]}]
-    if context_block:
-        convo_msgs.append({
-            "role": "system",
-            "content": f"Use the following CONTEXT if helpful. If irrelevant, ignore.\n\nCONTEXT START\n{context_block}\nCONTEXT END"
-        })
-    for m in st.session_state.messages[1:]:
-        if m["role"] in ("user", "assistant"):
-            convo_msgs.append(m)
-
-    with st.chat_message("assistant", avatar=AVATAR_ASSISTANT):
         with st.spinner("Thinking…"):
-            try:
-                resp = client.chat.completions.create(
-                    model=st.session_state["model"],
-                    messages=convo_msgs,
-                    temperature=st.session_state["temperature"],
-                )
-                answer = resp.choices[0].message.content
-            except Exception as e:
-                answer = f"Error from model: {e}"
+            answer = chat_with_openai(final_prompt, sys_prompt)
 
-            st.markdown(answer + (("\n\n" + refs_block) if refs_block else ""))
+        st.session_state.history.append(("assistant", answer, citations))
 
-    st.session_state.messages.append({"role": "assistant", "content": answer + (("\n\n" + refs_block) if refs_block else "")})
+    # Render chat
+    for role_tuple in st.session_state.history:
+        role = role_tuple[0]
+        if role == "user":
+            with st.chat_message("user"):
+                st.write(role_tuple[1])
+        else:
+            # assistant
+            msg = role_tuple[1]
+            cites = role_tuple[2] if len(role_tuple) > 2 else []
+            with st.chat_message("assistant", avatar=_first_existing(ICON_PATH, LOGO_PATH)):
+                st.write(msg)
+                if cites:
+                    st.markdown("**Sources:**")
+                    for t in cites:
+                        st.markdown(f"- {t}")
 
-# ---------- Footer ----------
-st.markdown("---")
-st.caption("Tip: Rotate the passcode in Streamlit **Secrets** when needed. PDFs are stored in the app server's Chroma DB and never pushed to Git.")
+    st.caption("Tip: If you say *“Tell me about Jose’s paper”*, the retriever boosts documents whose "
+               "title or author metadata match ‘Jose’ so those chunks rank first.")
+
+if __name__ == "__main__":
+    main()
