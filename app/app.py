@@ -16,12 +16,12 @@ import base64
 from typing import List, Tuple, Optional, Dict, Any
 import streamlit as st
 
-# === Robust image resolution: files live next to app.py ===
 from pathlib import Path
 from PIL import Image
 
 ROOT = Path(__file__).parent.resolve()
 
+# ---------- Image helpers ----------
 def _first_existing_local(*names: str) -> Optional[Path]:
     for n in names:
         if not n:
@@ -44,23 +44,31 @@ def _to_data_uri(p: Optional[Path]) -> Optional[str]:
         return None
     try:
         raw = p.read_bytes()
-        b64 = base64.b64encode(raw).decode("utf-8")
         ext = p.suffix.lower()
         mime = "image/png" if ext == ".png" else "image/jpeg"
+        b64 = base64.b64encode(raw).decode("utf-8")
         return f"data:{mime};base64,{b64}"
     except Exception:
         return None
 
-# Your exact filenames (both in the same folder as app.py)
-LOGO_FILE = _first_existing_local("logo_icon.jpg")      # favicon + header + sidebar
-ICON_FILE = _first_existing_local("icon_kelp.png")      # assistant avatar
+# Try common filenames/extensions (adjust these to match your repo)
+LOGO_FILE = _first_existing_local(
+    "kelp_ark_logo.png", "logo_icon.jpg", "kelp_ark_logo.png", "kelp_ark_logo.jpg"
+)  # favicon + header + sidebar
 
-# Configure page ASAP so favicon/title appear on auth screen too
-# IMPORTANT: pass a STRING PATH (not PIL) to avoid favicon cache weirdness
+ASSISTANT_ICON_FILE = _first_existing_local(
+    "model_avatar.png", "icon_kelp.jpg", "kelp_icon.png", "kelp_icon.jpg"
+)  # assistant avatar
+
+USER_ICON_FILE = _first_existing_local(
+    "user_avater.png", "test_tube.jpg", "icon_test_tube.png", "icon_test_tube.jpg"
+)  # user avatar
+
+# ---------- Page config (favicon/tab icon) ----------
 st.set_page_config(
     page_title="KelpGPT",
     page_icon=(str(LOGO_FILE) if LOGO_FILE else "🪸"),
-    layout="wide"
+    layout="wide",
 )
 
 # --- Local dev only: load .env if present (ignored in git) ---
@@ -74,9 +82,8 @@ except Exception:
 # Secrets / Config helpers
 # ---------------------------
 def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    # Prefer Streamlit secrets (cloud), fallback to env (local)
     try:
-        value = st.secrets.get(name)  # None if missing
+        value = st.secrets.get(name)
         if value is None:
             return os.getenv(name, default)
         return value
@@ -185,7 +192,6 @@ def _get_chroma():
     return client, collection
 
 def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> List[str]:
-    # Simple word-boundary chunking to stay under token limits
     words = text.split()
     chunks = []
     start = 0
@@ -196,14 +202,12 @@ def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> List[s
     return chunks
 
 def _parse_pdf_year(raw_date: Optional[str]) -> Optional[str]:
-    """Parse PDF CreationDate like 'D:20230715123456Z' -> '2023'."""
     if not raw_date:
         return None
     m = re.search(r"(19|20)\d{2}", raw_date)
     return m.group(0) if m else None
 
 def _extract_pdf_core_metadata(file_bytes: bytes) -> Dict[str, Any]:
-    """Best-effort pull of title/author/year from PDF metadata."""
     try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(file_bytes))
@@ -229,11 +233,6 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
     return "\n\n".join(texts)
 
 def _build_apa_citation(meta: Dict[str, Any], fallback_filename: str) -> str:
-    """
-    Render an APA-ish line from metadata.
-    Expected keys: apa_authors, apa_year, apa_title, apa_container, apa_doi, url
-    Falls back to PDF core metadata (title/authors/year) or filename.
-    """
     authors = meta.get("apa_authors") or meta.get("authors")
     year    = meta.get("apa_year") or meta.get("year")
     title   = meta.get("apa_title") or meta.get("title")
@@ -241,7 +240,6 @@ def _build_apa_citation(meta: Dict[str, Any], fallback_filename: str) -> str:
     doi     = meta.get("apa_doi")
     url     = meta.get("url")
 
-    # Fallback to filename if minimal info
     if not (authors or title):
         return fallback_filename
 
@@ -249,7 +247,7 @@ def _build_apa_citation(meta: Dict[str, Any], fallback_filename: str) -> str:
     if authors: parts.append(f"{authors}")
     if year:    parts.append(f"({year}).")
     if title:   parts.append(f"{title}.")
-    if journal: parts.append(f"*{journal}*.")  # italics in Markdown
+    if journal: parts.append(f"*{journal}*.")
     if doi:
         parts.append(f"https://doi.org/{doi}")
     elif url:
@@ -270,7 +268,7 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
 # UI Layout
 # ---------------------------
 with st.sidebar:
-    # Keep logo in sidebar
+    # Sidebar logo
     try:
         if LOGO_FILE:
             st.logo(str(LOGO_FILE))
@@ -294,7 +292,6 @@ with st.sidebar:
         type=["pdf"], accept_multiple_files=True
     )
 
-    # Optional: sidecar JSON mapping filenames -> APA fields
     meta_sidecar = st.file_uploader(
         "Optional: metadata JSON (APA fields per filename)",
         type=["json"],
@@ -317,41 +314,35 @@ with st.sidebar:
                 add_count = 0
                 for f in up_files:
                     raw = f.read()
-
-                    # Extract text
                     text = _extract_text_from_pdf(raw)
                     if not text.strip():
                         continue
                     chunks = _chunk_text(text)
 
-                    # Build per-file metadata (APA)
                     core = _extract_pdf_core_metadata(raw)
                     user = sidecar_map.get(f.name, {})
 
                     base_meta = {
                         "source_filename": f.name,
-                        # Preferred APA fields if provided by sidecar:
                         "apa_authors": user.get("apa_authors"),
                         "apa_year": user.get("apa_year"),
                         "apa_title": user.get("apa_title"),
                         "apa_container": user.get("apa_container"),
                         "apa_doi": user.get("apa_doi"),
                         "url": user.get("url"),
-                        # Best-effort fallbacks from PDF core metadata:
                         "authors": core.get("authors"),
                         "year": core.get("year"),
                         "title": core.get("title"),
-                        "journal": user.get("apa_container"),  # for _build_apa_citation fallback
+                        "journal": user.get("apa_container"),
                     }
 
-                    # Content-addressable IDs so re-ingesting is idempotent-ish
                     import hashlib
                     base = hashlib.sha1(raw).hexdigest()
                     ids = [f"{base}-{i}" for i in range(len(chunks))]
                     metadatas = []
                     for i in range(len(chunks)):
-                        m = dict(base_meta)  # copy
-                        m["chunk"] = i  # still store chunk for debugging if needed
+                        m = dict(base_meta)
+                        m["chunk"] = i
                         metadatas.append(m)
 
                     collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
@@ -369,34 +360,41 @@ with st.sidebar:
     )
     temperature = st.slider("Creativity (temperature)", 0.0, 1.2, 0.3, 0.1)
 
-# Initialize chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "system", "content": "You are KelpGPT, a precise, helpful marine science research assistant. Cite sources if provided in context."}
-    ]
-
-# --- Header: logo inline with text (perfect alignment) ---
+# ---------- Header with left intro + right logo ----------
 LOGO_DATA_URI = _to_data_uri(LOGO_FILE) if LOGO_FILE else None
+
 st.markdown(
     f"""
-    <div style="display:flex;align-items:center;gap:12px;margin:6px 0 2px 0;">
-        {('<img src="'+LOGO_DATA_URI+'" style="width:48px;height:48px;border-radius:8px;object-fit:cover;">') if LOGO_DATA_URI else ''}
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin:6px 0 10px 0;">
+      <div style="display:flex;align-items:center;gap:12px;">
+        {('<img src="'+LOGO_DATA_URI+'" style="width:40px;height:40px;border-radius:8px;object-fit:cover;">') if LOGO_DATA_URI else ''}
         <div>
-            <div style="font-size:22px;font-weight:600;line-height:1.1;">I'm KARA, how can I help you?</div>
-            <div style="margin-top:2px;color:#8a8a8a;">KelpArk Research Assistant</div>
+          <div style="font-size:22px;font-weight:600;line-height:1.1;">I'm KARA, how can I help you?</div>
+          <div style="margin-top:2px;color:#8a8a8a;">KelpArk Research Assistant</div>
         </div>
+      </div>
+      <div>
+        {('<img src="'+LOGO_DATA_URI+'" alt="Kelp Ark" style="height:40px;">') if LOGO_DATA_URI else ''}
+      </div>
     </div>
     """,
     unsafe_allow_html=True
 )
 
-# Preload assistant avatar (use string path for robustness)
-AVATAR_ASSISTANT = (str(ICON_FILE) if ICON_FILE else "🤖")
+# ---------- Avatars ----------
+AVATAR_ASSISTANT = (str(ASSISTANT_ICON_FILE) if ASSISTANT_ICON_FILE else "🪸")
+AVATAR_USER      = (str(USER_ICON_FILE) if USER_ICON_FILE else "🧪")
+
+# ---------- Chat history init ----------
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "system", "content": "You are KelpGPT, a precise, helpful marine science research assistant. Cite sources if provided in context."}
+    ]
 
 # Render prior messages (user/assistant only) with avatars
 for m in st.session_state.messages:
     if m["role"] in ("user", "assistant"):
-        avatar = "🙂" if m["role"] == "user" else AVATAR_ASSISTANT
+        avatar = AVATAR_USER if m["role"] == "user" else AVATAR_ASSISTANT
         with st.chat_message(m["role"], avatar=avatar):
             st.markdown(m["content"])
 
@@ -412,7 +410,6 @@ def _get_collection():
         return None
 
 def retrieve(query: str, k: int = 5) -> List[Tuple[str, dict]]:
-    """Return list of (doc, metadata)"""
     collection = _get_collection()
     if collection is None:
         return []
@@ -439,7 +436,6 @@ def build_apa_sources_note(ctx: List[Tuple[str, dict]]) -> str:
         apa = _build_apa_citation(m, m.get("source_filename", "Unknown source"))
         apa_lines.append(apa)
     apa_lines = _dedupe_preserve_order(apa_lines)
-    # Render as a newline list under "References"
     return "\n\n**References**\n" + "\n".join(f"- {line}" for line in apa_lines)
 
 # ---------------------------
@@ -447,15 +443,24 @@ def build_apa_sources_note(ctx: List[Tuple[str, dict]]) -> str:
 # ---------------------------
 prompt = st.chat_input("Ask something…")
 if prompt:
-    # add user msg
+    # add user msg (store)
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user", avatar="🙂"):
+    # echo user with test-tube avatar
+    with st.chat_message("user", avatar=AVATAR_USER):
         st.markdown(prompt)
 
     # retrieve context if enabled
     context_block = ""
     refs_block = ""
-    if use_rag:
+    if 'use_rag' in st.session_state or True:
+        # use current toggle directly
+        if 'use_rag' not in st.session_state:
+            st.session_state.use_rag = True
+        use_rag_local = st.session_state.get('use_rag', True)
+    else:
+        use_rag_local = True
+
+    if use_rag_local:
         ctx = retrieve(prompt, k=5)
         if ctx:
             context_block = format_context(ctx)  # model-visible
@@ -469,7 +474,6 @@ if prompt:
             "role": "system",
             "content": f"Use the following CONTEXT if helpful. If irrelevant, ignore.\n\nCONTEXT START\n{context_block}\nCONTEXT END"
         })
-    # append conversation so far (excluding first system, which we manually added)
     for m in st.session_state.messages[1:]:
         if m["role"] in ("user", "assistant"):
             convo_msgs.append(m)
@@ -488,7 +492,6 @@ if prompt:
                 answer = f"Error from model: {e}"
 
             st.markdown(answer + (("\n\n" + refs_block) if refs_block else ""))
-    # add assistant msg
     st.session_state.messages.append(
         {"role": "assistant", "content": answer + (("\n\n" + refs_block) if refs_block else "")}
     )
