@@ -279,11 +279,11 @@ with st.sidebar:
         else:
             st.write("KelpGPT")
 
-    st.toggle("Use document retrieval (RAG)", value=st.session_state.use_rag, key="use_rag", help="Turn off to chat without pulling from your PDFs.")
+    st.toggle("Use document retrieval", value=st.session_state.use_rag, key="use_rag", help="Turn off to chat without pulling from your PDFs.")
 
-    st.markdown("### Upload PDFs (optional)")
+    st.markdown("### Upload PDFs (Not Available...need to build still)")
     up_files = st.file_uploader("Add PDFs to the local index (Chroma).", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed")
-    meta_sidecar = st.file_uploader("Optional: metadata JSON (APA fields per filename)", type=["json"])
+    meta_sidecar = st.file_uploader("Not Functional Yet: metadata JSON (APA fields per filename)", type=["json"])
     ingest_click = st.button("Ingest PDFs")
 
     st.markdown("---")
@@ -298,7 +298,7 @@ with st.sidebar:
 # ---------- Main header ----------
 st.markdown(
     """
-    <div style="font-size:20px; font-weight:500; color:#cccccc; margin-bottom:4px;">
+    <div style="font-size:25px; font-weight:500; color:#cccccc; margin-bottom:4px;">
         KelpGPT – Internal research assistant
     </div>
     """,
@@ -313,7 +313,7 @@ with col_left:
         <div style="font-size:35px; font-weight:600; line-height:1.1;">
             I'm KARA, how can I help you?
         </div>
-        <div style="margin-top:6px; font-size:18px; font-weight:500; color:#aaaaaa;">
+        <div style="margin-top:6px; font-size:25px; font-weight:500; color:#aaaaaa;">
             KelpArk Research Assistant
         </div>
         """,
@@ -328,7 +328,7 @@ with col_right:
 collection_for_status = _get_collection()
 if collection_for_status is not None:
     try:
-        st.info(f"RAG online. Collection contains ~{collection_for_status.count()} chunks.")
+        st.info(f"Internal database is online.")
     except Exception:
         st.info(f"RAG online. Collection '{TEXT_COLLECTION}' is available.")
 else:
