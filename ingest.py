@@ -2,13 +2,13 @@
 # ---------------------------------------------
 # Ingest PDFs into a local Chroma DB with rich metadata
 # - Stores human-readable paper_title and authors for better citations
-# - Uses a stable doc_id per PDF so you can re-ingest safely
-# - Ensures the same embedding model is used across runs
+# - Stable doc_id per PDF; safe to re-run (upsert)
+# - Guards against embedding model mismatch errors
 # ---------------------------------------------
 
 import os
+import re
 import glob
-import uuid
 import hashlib
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
@@ -30,7 +30,7 @@ from chromadb.utils import embedding_functions
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
 TEXT_COLLECTION    = os.getenv("TEXT_COLLECTION", "papers_text")
-DATA_DIR           = Path(os.getenv("PAPERS_DIR", Path("data") / "papers"))
+PAPERS_DIR         = Path(os.getenv("PAPERS_DIR", Path("data") / "papers"))
 EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-large")  # pin this
 
 assert OPENAI_API_KEY, "OPENAI_API_KEY is not set"
@@ -40,7 +40,6 @@ assert OPENAI_API_KEY, "OPENAI_API_KEY is not set"
 def read_pdf(path: Path) -> Tuple[str, Dict[str, Any]]:
     """Return raw text and raw PDF metadata dict."""
     reader = PdfReader(str(path))
-    # Concatenate pages
     pages = []
     for pg in reader.pages:
         try:
@@ -49,11 +48,9 @@ def read_pdf(path: Path) -> Tuple[str, Dict[str, Any]]:
             pages.append("")
     text = "\n".join(pages)
 
-    # pypdf metadata
     md = {}
     try:
         info = reader.metadata or {}
-        # Convert to regular dict with strings
         for k, v in (info or {}).items():
             key = str(k).strip("/")
             md[key] = str(v) if v is not None else ""
@@ -63,39 +60,46 @@ def read_pdf(path: Path) -> Tuple[str, Dict[str, Any]]:
     return text, md
 
 
-def guess_title_and_authors(raw_text: str, pdf_meta: Dict[str, Any]) -> Tuple[str, str]:
-    """Heuristic:
-    1) Use PDF metadata Title/Author when available.
-    2) Else, use the first non-empty line of the first ~1500 chars as title.
-    3) Authors: try metadata; else look for a line with multiple commas near the top.
+def guess_title_and_authors(raw_text: str, pdf_meta: Dict[str, Any], file_name: str = "") -> Tuple[str, str]:
     """
-    title = (pdf_meta.get("Title") or pdf_meta.get("title") or "").strip()
-    authors = (pdf_meta.get("Author") or pdf_meta.get("author") or "").strip()
+    Aggressive title/author extraction:
+    1) Use PDF metadata fields when present.
+    2) Else, infer title from the top of page 1 (before 'Abstract', first 60 lines).
+    3) Authors: metadata; else the next short line that looks like a names list.
+    4) Final title fallback: filename stem.
+    """
+    meta_title = (pdf_meta.get("Title") or pdf_meta.get("title") or "").strip()
+    meta_auth  = (pdf_meta.get("Author") or pdf_meta.get("author") or "").strip()
 
-    head = (raw_text or "")[:2000]
+    title = meta_title
+    authors = meta_auth
+
+    head = (raw_text or "")[:4000]
     lines = [ln.strip() for ln in head.splitlines() if ln.strip()]
 
-    if not title and lines:
-        # Often first line is the paper title
-        title = lines[0]
-        # If it's suspiciously short or shouty, try the second line
-        if len(title) < 5 and len(lines) > 1:
-            title = lines[1]
-
-    if not authors:
-        # crude guess: line with several commas (names separated)
-        cand = ""
-        for ln in lines[:15]:
-            if ("," in ln and len(ln) < 200) or (" and " in ln.lower()):
-                cand = ln
-                break
-        authors = cand
-
-    # Clean fallbacks
     if not title:
-        title = "Untitled Paper"
+        cut = []
+        for ln in lines[:60]:
+            if re.match(r"^\s*abstract[:\s]*$", ln.lower()) or ln.lower().startswith("abstract"):
+                break
+            cut.append(ln)
+        candidates = [ln for ln in cut if 8 <= len(ln) <= 180 and not ln.endswith(".")]
+        if candidates:
+            title = candidates[0]
+
+    if not title:
+        title = Path(file_name).stem.replace("_", " ").replace("-", " ").strip() or "Untitled Paper"
+
     if not authors:
-        authors = ""
+        cand = ""
+        try_idx = min(lines.index(title) + 1 if title in lines else 0, len(lines)-1)
+        scan = lines[try_idx: try_idx + 12]
+        for ln in scan:
+            if (ln.count(",") >= 1 or " and " in ln.lower()) and len(ln) < 200:
+                if not re.search(r"@|university|institute|department|laboratory", ln.lower()):
+                    cand = ln
+                    break
+        authors = cand.strip()
 
     return title.strip(), authors.strip()
 
@@ -112,7 +116,6 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[st
         ln_len = len(ln)
         if cur_len + ln_len + 1 > chunk_size:
             blocks.append("\n".join(cur).strip())
-            # overlap by characters (approx via lines)
             if overlap > 0:
                 joined = "\n".join(cur).strip()
                 tail = joined[-overlap:]
@@ -126,7 +129,6 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[st
     if cur:
         blocks.append("\n".join(cur).strip())
 
-    # filter empties
     return [b for b in blocks if b]
 
 
@@ -151,11 +153,10 @@ def ensure_collection(client: Client, name: str):
             raise RuntimeError(
                 f"Embedding model mismatch.\n"
                 f"Persisted: {used_model}\nNew: {EMBED_MODEL}\n"
-                f"To fix: re-ingest with the same model, or delete the collection at {CHROMA_PERSIST_DIR}."
+                f"To fix: delete/rename '{CHROMA_PERSIST_DIR}' or reconfigure EMBED_MODEL."
             )
         return coll
 
-    # Create new collection
     ef = embedding_functions.OpenAIEmbeddingFunction(
         api_key=OPENAI_API_KEY,
         model_name=EMBED_MODEL
@@ -169,17 +170,15 @@ def ensure_collection(client: Client, name: str):
 
 
 def main():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    pdf_paths = sorted(glob.glob(str(DATA_DIR / "*.pdf")))
-    print(f"Indexing {len(pdf_paths)} PDF(s) from {DATA_DIR} into collection '{TEXT_COLLECTION}'")
+    PAPERS_DIR.mkdir(parents=True, exist_ok=True)
+    pdf_paths = sorted(glob.glob(str(PAPERS_DIR / "*.pdf")))
+    print(f"Indexing {len(pdf_paths)} PDF(s) from {PAPERS_DIR} into collection '{TEXT_COLLECTION}'")
 
     client = Client(Settings(
         chroma_db_impl="duckdb+parquet",
         persist_directory=CHROMA_PERSIST_DIR,
     ))
 
-    # Important: attach embedding function at collection creation time
     coll = ensure_collection(client, TEXT_COLLECTION)
 
     added = 0
@@ -190,7 +189,7 @@ def main():
             print(f" - Skipping (empty text): {p.name}")
             continue
 
-        title, authors = guess_title_and_authors(raw, meta)
+        title, authors = guess_title_and_authors(raw, meta, p.name)
         chunks = chunk_text(raw)
 
         did = stable_doc_id(p)
@@ -210,7 +209,6 @@ def main():
                 "chunk_index": i
             })
 
-        # Upsert (safe to re-run)
         coll.upsert(ids=ids, documents=docs, metadatas=metadatas)
         print(f" - Ingested: {p.name}  | title: {title}  | chunks: {len(chunks)}")
         added += len(chunks)
