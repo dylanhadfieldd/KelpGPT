@@ -303,8 +303,8 @@ st.caption("Internal research assistant")
 col_left, col_right = st.columns([1, 0.12])
 with col_left:
     st.markdown(
-        "<div style='font-size:22px;font-weight:600;line-height:1.1;'>I'm KARA, how can I help you?</div>"
-        "<div style='margin-top:2px;color:#8a8a8a;'>KelpArk Research Assistant</div>",
+        "<div style='font-size:35px;font-weight:600;line-height:1.1;'>I'm KARA, how can I help you?</div>"
+        "<div style='margin-top:15px;color:#8a8a8a;'>KelpArk Research Assistant</div>",
         unsafe_allow_html=True
     )
 with col_right:
@@ -452,6 +452,7 @@ if prompt:
             "Prefer information from the provided context. If the user asks about a specific paper "
             "(e.g., 'Jose's paper'), answer primarily from chunks whose metadata (paper_title/authors) match. "
             "If context is missing, say so briefly and proceed with best knowledge."
+            "Include in-text citations for any data or reccomendations."
         )
     })
     if context_block:
