@@ -296,20 +296,33 @@ with st.sidebar:
     st.session_state.temperature = temperature
 
 # ---------- Main header ----------
-st.header("KelpGPT - Internal research assistant")
-
+st.markdown(
+    """
+    <div style="font-size:20px; font-weight:500; color:#cccccc; margin-bottom:4px;">
+        KelpGPT – Internal research assistant
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 # Right-aligned logo
 col_left, col_right = st.columns([1, 0.12])
 with col_left:
     st.markdown(
-        "<div style='font-size:35px;font-weight:600;line-height:1.1;'>I'm KARA, how can I help you?</div>"
-        "<div style='margin-top:25px;color:#8a8a8a;'>KelpArk Research Assistant</div>",
+        """
+        <div style="font-size:35px; font-weight:600; line-height:1.1;">
+            I'm KARA, how can I help you?
+        </div>
+        <div style="margin-top:6px; font-size:18px; font-weight:500; color:#aaaaaa;">
+            KelpArk Research Assistant
+        </div>
+        """,
         unsafe_allow_html=True
     )
 with col_right:
     if LOGO_FILE:
         st.image(str(LOGO_FILE), width=64)
+
 
 # ---------- RAG status banner ----------
 collection_for_status = _get_collection()
