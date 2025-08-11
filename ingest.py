@@ -31,7 +31,7 @@ OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
 TEXT_COLLECTION    = os.getenv("TEXT_COLLECTION", "papers_text")
 PAPERS_DIR         = Path(os.getenv("PAPERS_DIR", Path("data") / "papers"))
-EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-large")  # pin this
+EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # <-- match app.py (1536-dim)
 
 assert OPENAI_API_KEY, "OPENAI_API_KEY is not set"
 
@@ -52,7 +52,7 @@ def read_pdf(path: Path) -> Tuple[str, Dict[str, Any]]:
     try:
         info = reader.metadata or {}
         for k, v in (info or {}).items():
-            key = str(k).strip("/")
+            key = str(k).strip("/").strip()
             md[key] = str(v) if v is not None else ""
     except Exception:
         pass
