@@ -296,15 +296,15 @@ with st.sidebar:
     st.session_state.temperature = temperature
 
 # ---------- Main header ----------
-st.header("KelpGPT")
-st.caption("Internal research assistant")
+st.header("KelpGPT - Internal research assistant")
+
 
 # Right-aligned logo
 col_left, col_right = st.columns([1, 0.12])
 with col_left:
     st.markdown(
         "<div style='font-size:35px;font-weight:600;line-height:1.1;'>I'm KARA, how can I help you?</div>"
-        "<div style='margin-top:15px;color:#8a8a8a;'>KelpArk Research Assistant</div>",
+        "<div style='margin-top:25px;color:#8a8a8a;'>KelpArk Research Assistant</div>",
         unsafe_allow_html=True
     )
 with col_right:
@@ -315,7 +315,7 @@ with col_right:
 collection_for_status = _get_collection()
 if collection_for_status is not None:
     try:
-        st.info(f"RAG online. Collection '{TEXT_COLLECTION}' contains ~{collection_for_status.count()} chunks.")
+        st.info(f"RAG online. Collection contains ~{collection_for_status.count()} chunks.")
     except Exception:
         st.info(f"RAG online. Collection '{TEXT_COLLECTION}' is available.")
 else:
