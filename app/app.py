@@ -277,7 +277,6 @@ def log_table_to_chat(df, caption: str = "Table"):
     except Exception:
         pass
 
-
 # ---------- Sidebar (old layout) ----------
 with st.sidebar:
     # One-time init for conversations (keeps your existing messages as the first chat)
@@ -317,7 +316,8 @@ with st.sidebar:
     st.subheader("Conversations")
 
     # Selector
-    labels = [(c["title"] if c["title"].strip() else "New chat")[:42] + ("" if len((c["title"] or "")) <= 42 else "…")
+    labels = [(c["title"] if c["title"].strip() else "New chat")[:42] +
+              ("" if len((c["title"] or "")) <= 42 else "…")
               for c in convos]
     selected = st.radio(
         label="",
@@ -331,73 +331,9 @@ with st.sidebar:
         st.session_state.active_convo = selected
         active_idx = selected
 
-    # --- Local helpers (scoped to sidebar for true drop-in) ---
-    def _md_to_html_local(md_text: str) -> str:
-        try:
-            import markdown  # pip install markdown
-            return markdown.markdown(md_text or "", extensions=["tables", "fenced_code"])
-        except Exception:
-            import html
-            return "<pre>" + html.escape(md_text or "") + "</pre>"
-
-    def _logo_data_uri() -> str:
-        # embed logo via data URI if available (most robust for xhtml2pdf)
-        try:
-            if LOGO_FILE and Path(LOGO_FILE).exists():
-                import base64, mimetypes
-                mime = mimetypes.guess_type(str(LOGO_FILE))[0] or "image/png"
-                b64 = base64.b64encode(Path(LOGO_FILE).read_bytes()).decode("ascii")
-                return f"data:{mime};base64,{b64}"
-        except Exception:
-            pass
-        return ""
-
-    def _build_chat_html(chat: dict) -> str:
-        title = (chat.get("title") or "KelpGPT Chat")
-        logo_uri = _logo_data_uri()
-        parts = [
-            "<html><head><meta charset='utf-8'>",
-            "<style>",
-            "@page { size: letter; margin: 36pt; @bottom-right { content: 'Page ' counter(page) ' of ' counter(pages); } }",
-            "body{font-family:Helvetica,Arial,sans-serif;font-size:12px;}",
-            ".hdr{border-bottom:1px solid #999;padding-bottom:8px;margin-bottom:16px;display:flex;gap:12px;align-items:center;}",
-            ".hdr .meta{line-height:1.2;}",
-            ".hdr h2{margin:0 0 4px 0;}",
-            ".logo{height:32px;}",
-            ".msg{margin:12px 0;padding:10px 12px;border-radius:8px;}",
-            ".user{background:#f3f6ff;border:1px solid #c9d6ff;}",
-            ".assistant{background:#f6fff7;border:1px solid #c9f5cf;}",
-            ".role{font-weight:700;margin-bottom:4px;color:#444;}",
-            ".content table{border-collapse:collapse;width:100%;margin:6px 0;}",
-            ".content th,.content td{border:1px solid #ccc;padding:6px;text-align:left;font-size:12px;}",
-            ".content code{font-family:ui-monospace, SFMono-Regular, Menlo, monospace;}",
-            "</style></head><body>"
-        ]
-        # Header (logo + meta)
-        parts.append("<div class='hdr'>")
-        if logo_uri:
-            parts.append(f"<img class='logo' src='{logo_uri}' />")
-        parts.append("<div class='meta'>")
-        parts.append(f"<h2>{title}</h2>")
-        parts.append(f"<div>Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}</div>")
-        parts.append(f"<div>Chat ID: {chat.get('id')}</div>")
-        parts.append("</div></div>")
-
-        # Messages
-        for msg in chat.get("messages", []):
-            role = (msg.get("role") or "").lower()
-            role_cls = "user" if role == "user" else "assistant"
-            role_label = role.capitalize() if role else "Message"
-            parts.append(f"<div class='msg {role_cls}'>")
-            parts.append(f"<div class='role'>{role_label}</div>")
-            parts.append("<div class='content'>")
-            parts.append(_md_to_html_local(msg.get("content", "")))
-            parts.append("</div></div>")
-        parts.append("</body></html>")
-        return "".join(parts)
-
     # Actions
-    c1, c2, c3 = st.columns([1,1,1])
+    c1, c2, c3 = st.columns([1, 1, 1])
+
     with c1:
         if st.button("➕ New"):
             convos.insert(0, {
@@ -408,170 +344,183 @@ with st.sidebar:
             })
             st.session_state.active_convo = 0
             st.rerun()
+
     with c2:
         if st.button("🗑️ Delete", disabled=(len(convos) <= 1)):
             convos.pop(active_idx)
             st.session_state.active_convo = 0
             st.rerun()
-   with c3:
-    # Export current convo as PDF (prefer HTML->PDF for Markdown tables; fallback to reportlab)
-    export_chat = convos[active_idx]
 
-    # --- build HTML (for tables) ---
-    def _md_to_html_local(md_text: str) -> str:
-        try:
-            import markdown
-            return markdown.markdown(md_text or "", extensions=["tables", "fenced_code"])
-        except Exception:
-            import html
-            return "<pre>" + html.escape(md_text or "") + "</pre>"
+    with c3:
+        # Export current convo as PDF (prefer HTML->PDF for Markdown tables; fallback to reportlab)
+        export_chat = convos[active_idx]
 
-    def _logo_data_uri() -> str:
-        try:
-            if LOGO_FILE and Path(LOGO_FILE).exists():
-                import base64, mimetypes
-                mime = mimetypes.guess_type(str(LOGO_FILE))[0] or "image/png"
-                b64 = base64.b64encode(Path(LOGO_FILE).read_bytes()).decode("ascii")
-                return f"data:{mime};base64,{b64}"
-        except Exception:
-            pass
-        return ""
+        # --- build HTML (for tables) ---
+        def _md_to_html_local(md_text: str) -> str:
+            try:
+                import markdown
+                return markdown.markdown(md_text or "", extensions=["tables", "fenced_code"])
+            except Exception:
+                import html
+                return "<pre>" + html.escape(md_text or "") + "</pre>"
 
-    def _build_chat_html(chat: dict) -> str:
-        title = (chat.get("title") or "KelpGPT Chat")
-        logo_uri = _logo_data_uri()
-        parts = [
-            "<html><head><meta charset='utf-8'>",
-            "<style>",
-            "@page { size: letter; margin: 36pt; @bottom-right { content: 'Page ' counter(page) ' of ' counter(pages); } }",
-            "body{font-family:Helvetica,Arial,sans-serif;font-size:12px;}",
-            ".hdr{border-bottom:1px solid #999;padding-bottom:8px;margin-bottom:16px;display:flex;gap:12px;align-items:center;}",
-            ".logo{height:32px;}",
-            ".msg{margin:12px 0;padding:10px 12px;border-radius:8px;}",
-            ".user{background:#f3f6ff;border:1px solid #c9d6ff;}",
-            ".assistant{background:#f6fff7;border:1px solid #c9f5cf;}",
-            ".role{font-weight:700;margin-bottom:4px;color:#444;}",
-            ".content table{border-collapse:collapse;width:100%;margin:6px 0;}",
-            ".content th,.content td{border:1px solid #ccc;padding:6px;text-align:left;font-size:12px;}",
-            ".content code{font-family:ui-monospace, SFMono-Regular, Menlo, monospace;}",
-            "</style></head><body>"
-        ]
-        parts.append("<div class='hdr'>")
-        if logo_uri:
-            parts.append(f"<img class='logo' src='{logo_uri}' />")
-        parts.append(f"<div><h2 style='margin:0'>{title}</h2>"
-                     f"<div>Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}</div>"
-                     f"<div>Chat ID: {chat.get('id')}</div></div></div>")
-        for msg in chat.get("messages", []):
-            role = (msg.get("role") or "").lower()
-            role_cls = "user" if role == "user" else "assistant"
-            role_label = role.capitalize() if role else "Message"
-            parts.append(f"<div class='msg {role_cls}'>")
-            parts.append(f"<div class='role'>{role_label}</div>")
-            parts.append("<div class='content'>")
-            parts.append(_md_to_html_local(msg.get("content","")))
-            parts.append("</div></div>")
-        parts.append("</body></html>")
-        return "".join(parts)
+        def _logo_data_uri() -> str:
+            try:
+                if LOGO_FILE and Path(LOGO_FILE).exists():
+                    import base64, mimetypes
+                    mime = mimetypes.guess_type(str(LOGO_FILE))[0] or "image/png"
+                    b64 = base64.b64encode(Path(LOGO_FILE).read_bytes()).decode("ascii")
+                    return f"data:{mime};base64,{b64}"
+            except Exception:
+                pass
+            return ""
 
-    pdf_bytes = None
-    # 1) Try HTML -> PDF (tables supported)
-    try:
-        from xhtml2pdf import pisa  # pip install xhtml2pdf markdown
-        import io as _io
-        full_html = _build_chat_html(export_chat)
-        buf = _io.BytesIO()
-        status = pisa.CreatePDF(_io.StringIO(full_html), dest=buf)
-        if not status.err:
-            pdf_bytes = buf.getvalue()
-        buf.close()
-    except Exception:
+        def _build_chat_html(chat: dict) -> str:
+            title = (chat.get("title") or "KelpGPT Chat")
+            logo_uri = _logo_data_uri()
+            parts = [
+                "<html><head><meta charset='utf-8'>",
+                "<style>",
+                "@page { size: letter; margin: 36pt; @bottom-right { content: 'Page ' counter(page) ' of ' counter(pages); } }",
+                "body{font-family:Helvetica,Arial,sans-serif;font-size:12px;}",
+                ".hdr{border-bottom:1px solid #999;padding-bottom:8px;margin-bottom:16px;display:flex;gap:12px;align-items:center;}",
+                ".logo{height:32px;}",
+                ".msg{margin:12px 0;padding:10px 12px;border-radius:8px;}",
+                ".user{background:#f3f6ff;border:1px solid #c9d6ff;}",
+                ".assistant{background:#f6fff7;border:1px solid #c9f5cf;}",
+                ".role{font-weight:700;margin-bottom:4px;color:#444;}",
+                ".content table{border-collapse:collapse;width:100%;margin:6px 0;}",
+                ".content th,.content td{border:1px solid #ccc;padding:6px;text-align:left;font-size:12px;}",
+                ".content code{font-family:ui-monospace, SFMono-Regular, Menlo, monospace;}",
+                "</style></head><body>"
+            ]
+            parts.append("<div class='hdr'>")
+            if logo_uri:
+                parts.append(f"<img class='logo' src='{logo_uri}' />")
+            parts.append(f"<div><h2 style='margin:0'>{title}</h2>"
+                         f"<div>Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}</div>"
+                         f"<div>Chat ID: {chat.get('id')}</div></div></div>")
+            for msg in chat.get("messages", []):
+                role = (msg.get("role") or "").lower()
+                role_cls = "user" if role == "user" else "assistant"
+                role_label = role.capitalize() if role else "Message"
+                parts.append(f"<div class='msg {role_cls}'>")
+                parts.append(f"<div class='role'>{role_label}</div>")
+                parts.append("<div class='content'>")
+                parts.append(_md_to_html_local(msg.get("content", "")))
+                parts.append("</div></div>")
+            parts.append("</body></html>")
+            return "".join(parts)
+
         pdf_bytes = None
-
-    # 2) Fallback: plain reportlab PDF (always produces a PDF)
-    if not pdf_bytes:
+        # 1) Try HTML -> PDF (tables supported)
         try:
-            from reportlab.lib.pagesizes import LETTER
-            from reportlab.pdfgen import canvas
-            from reportlab.lib.units import inch
-            from reportlab.pdfbase import pdfmetrics
+            from xhtml2pdf import pisa  # pip install xhtml2pdf markdown
             import io as _io
-
-            def _wrap_text(text: str, max_width: float, font_name: str, font_size: int) -> list:
-                words = (text or "").split()
-                if not words:
-                    return [""]
-                lines, cur = [], ""
-                for w in words:
-                    test = (cur + " " + w).strip()
-                    if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
-                        cur = test
-                    else:
-                        if cur:
-                            lines.append(cur)
-                        cur = w
-                if cur:
-                    lines.append(cur)
-                return lines
-
+            full_html = _build_chat_html(export_chat)
             buf = _io.BytesIO()
-            c = canvas.Canvas(buf, pagesize=LETTER)
-            width, height = LETTER
-            left = 0.75 * inch; right = 0.75 * inch
-            top = 0.75 * inch; bottom = 0.75 * inch
-            y = height - top
-
-            # Title
-            title = (export_chat.get("title") or "KelpGPT Chat")
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(left, y, title); y -= 18
-            c.setFont("Helvetica", 9)
-            c.drawString(left, y, f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}"); y -= 12
-            c.drawString(left, y, f"Chat ID: {export_chat.get('id')}"); y -= 18
-            c.setLineWidth(0.5); c.line(left, y, width - right, y); y -= 12
-
-            # Messages
-            for msg in export_chat.get("messages", []):
-                role = msg.get("role", "").capitalize() or "Message"
-                content = msg.get("content", "") or ""
-                c.setFont("Helvetica-Bold", 11)
-                if y - 14 < bottom:
-                    c.showPage(); y = height - top
-                c.drawString(left, y, role); y -= 14
-
-                c.setFont("Helvetica", 10)
-                max_w = (width - left - right)
-                for line in _wrap_text(content, max_w, "Helvetica", 10):
-                    if y - 13 < bottom:
-                        c.showPage(); y = height - top; c.setFont("Helvetica", 10)
-                    c.drawString(left, y, line); y -= 13
-                y -= 6
-                if y < bottom:
-                    c.showPage(); y = height - top
-
-            c.save()
-            pdf_bytes = buf.getvalue()
+            status = pisa.CreatePDF(_io.StringIO(full_html), dest=buf)
+            if not status.err:
+                pdf_bytes = buf.getvalue()
             buf.close()
         except Exception:
             pdf_bytes = None
 
-    if pdf_bytes:
-        st.download_button(
-            "⬇️ Export PDF",
-            data=pdf_bytes,
-            file_name=f"kelpgpt_chat_{export_chat['id']}.pdf",
-            mime="application/pdf"
-        )
-    else:
-        # Last resort: JSON
-        export_payload = json.dumps(export_chat, ensure_ascii=False, indent=2)
-        st.download_button(
-            "⬇️ Export (JSON)",
-            data=export_payload,
-            file_name=f"kelpgpt_chat_{export_chat['id']}.json",
-            mime="application/json"
-        )
+        # 2) Fallback: plain reportlab PDF
+        if not pdf_bytes:
+            try:
+                from reportlab.lib.pagesizes import LETTER
+                from reportlab.pdfgen import canvas
+                from reportlab.lib.units import inch
+                from reportlab.pdfbase import pdfmetrics
+                import io as _io
 
+                def _wrap_text(text: str, max_width: float, font_name: str, font_size: int) -> list:
+                    words = (text or "").split()
+                    if not words:
+                        return [""]
+                    lines, cur = [], ""
+                    for w in words:
+                        test = (cur + " " + w).strip()
+                        if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
+                            cur = test
+                        else:
+                            if cur:
+                                lines.append(cur)
+                            cur = w
+                    if cur:
+                        lines.append(cur)
+                    return lines
+
+                buf = _io.BytesIO()
+                c = canvas.Canvas(buf, pagesize=LETTER)
+                width, height = LETTER
+                left = 0.75 * inch
+                right = 0.75 * inch
+                top = 0.75 * inch
+                bottom = 0.75 * inch
+                y = height - top
+
+                # Title
+                title = (export_chat.get("title") or "KelpGPT Chat")
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(left, y, title)
+                y -= 18
+                c.setFont("Helvetica", 9)
+                c.drawString(left, y, f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                y -= 12
+                c.drawString(left, y, f"Chat ID: {export_chat.get('id')}")
+                y -= 18
+                c.setLineWidth(0.5)
+                c.line(left, y, width - right, y)
+                y -= 12
+
+                # Messages
+                for msg in export_chat.get("messages", []):
+                    role = msg.get("role", "").capitalize() or "Message"
+                    content = msg.get("content", "") or ""
+                    c.setFont("Helvetica-Bold", 11)
+                    if y - 14 < bottom:
+                        c.showPage()
+                        y = height - top
+                    c.drawString(left, y, role)
+                    y -= 14
+
+                    c.setFont("Helvetica", 10)
+                    max_w = (width - left - right)
+                    for line in _wrap_text(content, max_w, "Helvetica", 10):
+                        if y - 13 < bottom:
+                            c.showPage()
+                            y = height - top
+                            c.setFont("Helvetica", 10)
+                        c.drawString(left, y, line)
+                        y -= 13
+                    y -= 6
+                    if y < bottom:
+                        c.showPage()
+                        y = height - top
+
+                c.save()
+                pdf_bytes = buf.getvalue()
+                buf.close()
+            except Exception:
+                pdf_bytes = None
+
+        if pdf_bytes:
+            st.download_button(
+                "⬇️ Export PDF",
+                data=pdf_bytes,
+                file_name=f"kelpgpt_chat_{export_chat['id']}.pdf",
+                mime="application/pdf"
+            )
+        else:
+            export_payload = json.dumps(export_chat, ensure_ascii=False, indent=2)
+            st.download_button(
+                "⬇️ Export (JSON)",
+                data=export_payload,
+                file_name=f"kelpgpt_chat_{export_chat['id']}.json",
+                mime="application/json"
+            )
 
     # Rename
     new_title = st.text_input(
@@ -588,7 +537,7 @@ with st.sidebar:
     # IMPORTANT: bind the selected conversation's messages to the app's message list
     st.session_state.messages = convos[active_idx]["messages"]
 
-    # Dummy vars so any downstream ingest block won't break (even if you remove it later)
+    # Dummy vars so any downstream ingest block won't break
     up_files = None
     meta_sidecar = None
     ingest_click = False
