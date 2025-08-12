@@ -336,14 +336,113 @@ with st.sidebar:
             st.session_state.active_convo = 0
             st.rerun()
     with c3:
-        # Export current convo JSON
-        export_payload = json.dumps(convos[active_idx], ensure_ascii=False, indent=2)
-        st.download_button(
-            "⬇️ Export",
-            data=export_payload,
-            file_name=f"kelpgpt_chat_{convos[active_idx]['id']}.json",
-            mime="application/json"
-        )
+        # Export current convo as PDF (fallback to JSON if reportlab not available)
+        export_chat = convos[active_idx]
+        pdf_bytes = None
+        try:
+            from reportlab.lib.pagesizes import LETTER
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.units import inch
+            from reportlab.pdfbase import pdfmetrics
+            import io as _io
+
+            def _wrap_text(text: str, max_width: float, font_name: str, font_size: int) -> list:
+                words = (text or "").split()
+                if not words:
+                    return [""]
+                lines, cur = [], ""
+                for w in words:
+                    test = (cur + " " + w).strip()
+                    if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
+                        cur = test
+                    else:
+                        lines.append(cur)
+                        cur = w
+                if cur:
+                    lines.append(cur)
+                return lines
+
+            buf = _io.BytesIO()
+            c = canvas.Canvas(buf, pagesize=LETTER)
+            width, height = LETTER
+
+            left = 0.75 * inch
+            right = 0.75 * inch
+            top = 0.75 * inch
+            bottom = 0.75 * inch
+            y = height - top
+
+            # Title
+            title = (export_chat.get("title") or "KelpGPT Chat")
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(left, y, title)
+            y -= 18
+
+            c.setFont("Helvetica", 9)
+            c.drawString(left, y, f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            y -= 12
+            c.drawString(left, y, f"Chat ID: {export_chat.get('id')}")
+            y -= 18
+
+            # Horizontal rule
+            c.setLineWidth(0.5)
+            c.line(left, y, width - right, y)
+            y -= 12
+
+            # Messages
+            for msg in export_chat.get("messages", []):
+                role = msg.get("role", "").capitalize() or "Message"
+                content = msg.get("content", "") or ""
+                # Role header
+                c.setFont("Helvetica-Bold", 11)
+                role_line = f"{role}"
+                role_h = 14
+                if y - role_h < bottom:
+                    c.showPage()
+                    y = height - top
+                c.drawString(left, y, role_line)
+                y -= role_h
+
+                # Content
+                c.setFont("Helvetica", 10)
+                max_w = (width - left - right)
+                for line in _wrap_text(content, max_w, "Helvetica", 10):
+                    line_h = 13
+                    if y - line_h < bottom:
+                        c.showPage()
+                        y = height - top
+                        c.setFont("Helvetica", 10)
+                    c.drawString(left, y, line)
+                    y -= line_h
+
+                # Spacing after each message
+                y -= 6
+                if y < bottom:
+                    c.showPage()
+                    y = height - top
+
+            c.save()
+            pdf_bytes = buf.getvalue()
+            buf.close()
+        except Exception:
+            pdf_bytes = None
+
+        if pdf_bytes:
+            st.download_button(
+                "⬇️ Export PDF",
+                data=pdf_bytes,
+                file_name=f"kelpgpt_chat_{export_chat['id']}.pdf",
+                mime="application/pdf"
+            )
+        else:
+            # Fallback: JSON if PDF generation isn't available
+            export_payload = json.dumps(export_chat, ensure_ascii=False, indent=2)
+            st.download_button(
+                "⬇️ Export (JSON)",
+                data=export_payload,
+                file_name=f"kelpgpt_chat_{export_chat['id']}.json",
+                mime="application/json"
+            )
 
     # Rename
     new_title = st.text_input(
@@ -356,27 +455,15 @@ with st.sidebar:
         convos[active_idx]["title"] = new_title
 
     st.markdown("---")
-    st.subheader("Model")
-    model = st.selectbox(" ",
-        ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
-        index=["gpt-4o-mini","gpt-4o","gpt-4.1-mini"].index(st.session_state.model),
-        label_visibility="collapsed"
-    )
-    st.session_state.model = model
-
-    st.write("Creativity (temperature)")
-    temperature = st.slider(
-        "", 0.0, 1.2, float(st.session_state.temperature), 0.1, label_visibility="collapsed"
-    )
-    st.session_state.temperature = temperature
 
     # IMPORTANT: bind the selected conversation's messages to the app's message list
     st.session_state.messages = convos[active_idx]["messages"]
 
-    # Dummy vars so the downstream ingest block doesn't break, but upload UI is removed
+    # Dummy vars so any downstream ingest block won't break (even if you remove it later)
     up_files = None
     meta_sidecar = None
     ingest_click = False
+
 
 
 # ---------- Main header ----------
