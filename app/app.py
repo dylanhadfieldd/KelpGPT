@@ -16,7 +16,7 @@ import json
 import base64
 import unicodedata
 from typing import List, Tuple, Optional, Dict, Any
-
+import reportlab
 import streamlit as st
 from pathlib import Path
 
