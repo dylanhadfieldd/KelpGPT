@@ -267,6 +267,20 @@ def _candidate_doc_ids_by_metadata(collection, hints: List[str], limit_docs: int
 
 # ---------- Sidebar (old layout) ----------
 with st.sidebar:
+    # One-time init for conversations (keeps your existing messages as the first chat)
+    if "convos" not in st.session_state:
+        st.session_state.convos = [{
+            "id": int(time.time()*1000),
+            "title": "New chat",
+            "created": time.time(),
+            "messages": st.session_state.get("messages", [])
+        }]
+        st.session_state.active_convo = 0
+
+    # Convenience handles
+    convos = st.session_state.convos
+    active_idx = st.session_state.get("active_convo", 0)
+
     # Logo
     try:
         if LOGO_FILE:
@@ -279,21 +293,91 @@ with st.sidebar:
         else:
             st.write("KelpGPT")
 
-    st.toggle("Use document retrieval", value=st.session_state.use_rag, key="use_rag", help="Turn off to chat without pulling from your PDFs.")
-
-    st.markdown("### Upload PDFs (Not Available...need to build still)")
-    up_files = st.file_uploader("Add PDFs to the local index (Chroma).", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed")
-    meta_sidecar = st.file_uploader("Not Functional Yet: metadata JSON (APA fields per filename)", type=["json"])
-    ingest_click = st.button("Ingest PDFs")
+    st.toggle(
+        "Use document retrieval",
+        value=st.session_state.use_rag,
+        key="use_rag",
+        help="Turn off to chat without pulling from your PDFs."
+    )
 
     st.markdown("---")
-    st.markdown("### Model")
-    model = st.selectbox(" ", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=["gpt-4o-mini","gpt-4o","gpt-4.1-mini"].index(st.session_state.model), label_visibility="collapsed")
+    st.subheader("Conversations")
+
+    # Selector
+    labels = [(c["title"] if c["title"].strip() else "New chat")[:42] + ("" if len((c["title"] or "")) <= 42 else "…")
+              for c in convos]
+    selected = st.radio(
+        label="",
+        options=list(range(len(convos))),
+        index=min(active_idx, len(convos)-1),
+        format_func=lambda i: labels[i],
+        label_visibility="collapsed",
+        key="chat_selector",
+    )
+    if selected != active_idx:
+        st.session_state.active_convo = selected
+        active_idx = selected
+
+    # Actions
+    c1, c2, c3 = st.columns([1,1,1])
+    with c1:
+        if st.button("➕ New"):
+            convos.insert(0, {
+                "id": int(time.time()*1000),
+                "title": "New chat",
+                "created": time.time(),
+                "messages": []
+            })
+            st.session_state.active_convo = 0
+            st.rerun()
+    with c2:
+        if st.button("🗑️ Delete", disabled=(len(convos) <= 1)):
+            convos.pop(active_idx)
+            st.session_state.active_convo = 0
+            st.rerun()
+    with c3:
+        # Export current convo JSON
+        export_payload = json.dumps(convos[active_idx], ensure_ascii=False, indent=2)
+        st.download_button(
+            "⬇️ Export",
+            data=export_payload,
+            file_name=f"kelpgpt_chat_{convos[active_idx]['id']}.json",
+            mime="application/json"
+        )
+
+    # Rename
+    new_title = st.text_input(
+        "Rename",
+        value=convos[active_idx]["title"],
+        max_chars=100,
+        help="Rename this conversation."
+    )
+    if new_title != convos[active_idx]["title"]:
+        convos[active_idx]["title"] = new_title
+
+    st.markdown("---")
+    st.subheader("Model")
+    model = st.selectbox(" ",
+        ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+        index=["gpt-4o-mini","gpt-4o","gpt-4.1-mini"].index(st.session_state.model),
+        label_visibility="collapsed"
+    )
     st.session_state.model = model
-    st.write("")  # spacing
+
     st.write("Creativity (temperature)")
-    temperature = st.slider("", 0.0, 1.2, float(st.session_state.temperature), 0.1, label_visibility="collapsed")
+    temperature = st.slider(
+        "", 0.0, 1.2, float(st.session_state.temperature), 0.1, label_visibility="collapsed"
+    )
     st.session_state.temperature = temperature
+
+    # IMPORTANT: bind the selected conversation's messages to the app's message list
+    st.session_state.messages = convos[active_idx]["messages"]
+
+    # Dummy vars so the downstream ingest block doesn't break, but upload UI is removed
+    up_files = None
+    meta_sidecar = None
+    ingest_click = False
+
 
 # ---------- Main header ----------
 st.markdown(
@@ -336,57 +420,7 @@ else:
 
 st.markdown("---")
 
-# ---------- Ingest (from sidebar button) ----------
-if ingest_click:
-    if not up_files:
-        st.warning("No PDFs selected.")
-    else:
-        sidecar_map: Dict[str, Dict[str, Any]] = {}
-        if meta_sidecar is not None:
-            try:
-                sidecar_map = json.loads(meta_sidecar.read().decode("utf-8"))
-            except Exception as e:
-                st.warning(f"Could not parse metadata JSON: {e}")
 
-        with st.spinner("Ingesting…"):
-            collection = _get_collection()
-            if collection is None:
-                st.error("RAG not available.")
-            else:
-                add_count = 0
-                for f in up_files:
-                    raw = f.read()
-                    text = _extract_text_from_pdf(raw)
-                    if not text.strip():
-                        continue
-                    chunks = _chunk_text(text)
-
-                    core = _extract_pdf_core_metadata(raw)
-                    user = sidecar_map.get(f.name, {})
-                    base_meta = {
-                        "source_filename": f.name,
-                        "authors": user.get("apa_authors") or core.get("authors"),
-                        "year":    user.get("apa_year")    or core.get("year"),
-                        "paper_title": user.get("apa_title") or core.get("title"),
-                        "journal": user.get("apa_container"),
-                        "url": user.get("url"),
-                    }
-
-                    import hashlib
-                    digest = hashlib.sha1(raw).hexdigest()
-                    ids = [f"{digest}-{i}" for i in range(len(chunks))]
-                    metadatas = []
-                    for i in range(len(chunks)):
-                        m = dict(base_meta)
-                        m["chunk_index"] = i
-                        metadatas.append(m)
-
-                    collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
-                    add_count += len(chunks)
-
-                st.success(f"Ingested {add_count} chunks.")
-                if meta_sidecar is not None:
-                    st.info("Metadata JSON applied where filenames matched.")
 
 # ---------- Avatars + history ----------
 AVATAR_ASSISTANT = (str(ASSISTANT_ICON_FILE) if ASSISTANT_ICON_FILE else "🪸")
