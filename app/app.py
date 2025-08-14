@@ -1,11 +1,12 @@
 # app.py
 # Streamlit + Passcode Gate + RAG (Chroma) + Chat with OpenAI
 # ---------------------------------------------------------------
-# - Layout matches the "old" format: RAG toggle + Upload + Model/Temp in sidebar
+# - Layout: RAG toggle + Export + Conversations in sidebar
 # - Uses OpenAI embeddings (default: text-embedding-3-small, 1536-dim)
-# - Avatars: assistant = kelp icon, user = test-tube icon
+# - Avatars: assistant = kelp icon, user = test-tube icon (auto-discovered)
 # - Metadata-aware retrieval: if the user hints an author/title (e.g., "Jose"),
-#   we first filter by metadata (paper_title/authors), then do semantic ranking.
+#   we filter by metadata first, then do semantic ranking.
+# - References: tries external `citations` module if available; otherwise APA fallback.
 # ---------------------------------------------------------------
 
 import os
@@ -16,27 +17,36 @@ import json
 import base64
 import unicodedata
 from typing import List, Tuple, Optional, Dict, Any
-import reportlab
+
 import streamlit as st
 from pathlib import Path
-import mimetypes   # guesses file type for embedding logo
-
+import mimetypes  # guesses file type for embedding logo
 
 # ---------- Page setup early (favicon/title on auth screen too) ----------
 ROOT = Path(__file__).parent.resolve()
 
 def _first_existing_local(*names: str) -> Optional[Path]:
-    for n in names:
-        if not n:
-            continue
-        p = (ROOT / n).resolve()
-        if p.exists():
-            return p
+    """Search for a file under common local roots (Windows & Linux friendly)."""
+    search_roots = [ROOT, ROOT / "app", ROOT / "app" / "assets"]
+    for r in search_roots:
+        for n in names:
+            if not n:
+                continue
+            p = (r / n).resolve()
+            if p.exists():
+                return p
     return None
 
-LOGO_FILE = _first_existing_local("logo_icon.png","logo_icon.jpg","kelp_ark_logo.png","kelp_ark_logo.jpg")
-ASSISTANT_ICON_FILE = _first_existing_local("icon_kelp.png","icon_kelp.jpg","kelp_icon.png","kelp_icon.jpg","model_avatar.png")
-USER_ICON_FILE      = _first_existing_local("user_avater.png","test_tube.jpg","icon_test_tube.png","icon_test_tube.jpg","user_model.png")
+LOGO_FILE = _first_existing_local(
+    "logo_icon.png", "logo_icon.jpg", "kelp_ark_logo.png", "kelp_ark_logo.jpg"
+)
+ASSISTANT_ICON_FILE = _first_existing_local(
+    "icon_kelp.png", "icon_kelp.jpg", "kelp_icon.png", "kelp_icon.jpg", "model_avatar.png"
+)
+# fix typo: 'user_avater' -> 'user_avatar'
+USER_ICON_FILE = _first_existing_local(
+    "user_avatar.png", "test_tube.jpg", "icon_test_tube.png", "icon_test_tube.jpg", "user_model.png"
+)
 
 st.set_page_config(page_title="KelpGPT", page_icon=(str(LOGO_FILE) if LOGO_FILE else "🪸"), layout="wide")
 
@@ -55,11 +65,14 @@ def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     except Exception:
         return os.getenv(name, default)
 
-OPENAI_API_KEY     = _get_secret("OPENAI_API_KEY", "")
-APP_PASSCODE       = _get_secret("APP_PASSCODE", "")
-CHROMA_PERSIST_DIR = _get_secret("CHROMA_PERSIST_DIR", "chroma_db")
-TEXT_COLLECTION    = _get_secret("TEXT_COLLECTION", "papers_text")
-EMBED_MODEL        = _get_secret("EMBED_MODEL", "text-embedding-3-small")  # 1536-dim default
+OPENAI_API_KEY  = _get_secret("OPENAI_API_KEY", "")
+APP_PASSCODE    = _get_secret("APP_PASSCODE", "")
+raw_chroma_dir  = _get_secret("CHROMA_PERSIST_DIR", "chroma_db")
+TEXT_COLLECTION = _get_secret("TEXT_COLLECTION", "papers_text")
+EMBED_MODEL     = _get_secret("EMBED_MODEL", "text-embedding-3-small")  # 1536-dim default
+
+# Make the persist dir absolute so systemd / working dir changes don't break it
+CHROMA_PERSIST_DIR = str((ROOT / raw_chroma_dir).resolve())
 
 if not OPENAI_API_KEY:
     st.error("Server missing OPENAI_API_KEY.")
@@ -96,7 +109,7 @@ def require_auth() -> bool:
         st.stop()
 
     st.title("🔒 Team Access")
-    st.caption("Enter the 4‑digit passcode to use KelpGPT.")
+    st.caption("Enter the 4-digit passcode to use KelpGPT.")
 
     col1, col2 = st.columns([3,1])
     with col1:
@@ -155,7 +168,7 @@ def _get_collection():
         st.warning(f"RAG not available: {e}")
         return None
 
-# ---------- PDF helpers ----------
+# ---------- Helpers (PDF / Text) ----------
 def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> List[str]:
     words = text.split()
     chunks: List[str] = []
@@ -203,7 +216,7 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
             seen.add(x); out.append(x)
     return out
 
-# ---------- APA refs ----------
+# ---------- References (APA fallback + optional external module) ----------
 def _build_apa_line(meta: Dict[str, Any], fallback_filename: str) -> str:
     authors = meta.get("authors")
     title   = meta.get("paper_title") or meta.get("title")
@@ -224,6 +237,17 @@ def build_apa_sources_note(ctx: List[Tuple[str, dict]]) -> str:
     apa_lines = _dedupe_preserve_order(apa_lines)
     return "\n\n**References**\n" + "\n".join(apa_lines) if apa_lines else ""
 
+def _try_external_references(ctx: List[Tuple[str, dict]]) -> Optional[str]:
+    """If a `citations` module exists, use it. We try a few common function names."""
+    try:
+        import citations as _c
+        for fn in ("build_references_block", "build_apa_sources_note", "render_references"):
+            if hasattr(_c, fn):
+                return getattr(_c, fn)(ctx)
+    except Exception:
+        pass
+    return None
+
 # ---------- Metadata-aware retrieval helpers ----------
 def _norm(s: Optional[str]) -> str:
     if not s: return ""
@@ -237,7 +261,8 @@ def _extract_paper_hints(user_text: str) -> List[str]:
     for q in re.findall(r"['\"]([^'\"]{3,80})['\"]", user_text):
         hints.append(_norm(q))
     tokens = re.findall(r"[a-zA-Z]{3,}", t)
-    stop = {"paper","papers","about","the","and","from","study","article","report","figure","figures","seaweed","kelp","ulva","growth","what","know","joses"}
+    stop = {"paper","papers","about","the","and","from","study","article","report","figure","figures",
+            "seaweed","kelp","ulva","growth","what","know","joses"}
     for tok in tokens:
         if tok not in stop and 3 <= len(tok) <= 18:
             hints.append(tok)
@@ -267,7 +292,6 @@ def _candidate_doc_ids_by_metadata(collection, hints: List[str], limit_docs: int
                     break
     return doc_ids
 
-
 # --- Capture tables into the chat so they export nicely ---
 def log_table_to_chat(df, caption: str = "Table"):
     try:
@@ -277,7 +301,7 @@ def log_table_to_chat(df, caption: str = "Table"):
     except Exception:
         pass
 
-# ---------- Sidebar (old layout) ----------
+# ---------- Sidebar (conversations, export, toggles) ----------
 with st.sidebar:
     # One-time init for conversations (keeps your existing messages as the first chat)
     if "convos" not in st.session_state:
@@ -289,11 +313,10 @@ with st.sidebar:
         }]
         st.session_state.active_convo = 0
 
-    # Convenience handles
     convos = st.session_state.convos
     active_idx = st.session_state.get("active_convo", 0)
 
-    # Logo
+    # Logo (new Streamlit has st.logo)
     try:
         if LOGO_FILE:
             st.logo(str(LOGO_FILE))
@@ -367,7 +390,6 @@ with st.sidebar:
         def _logo_data_uri() -> str:
             try:
                 if LOGO_FILE and Path(LOGO_FILE).exists():
-                    import base64, mimetypes
                     mime = mimetypes.guess_type(str(LOGO_FILE))[0] or "image/png"
                     b64 = base64.b64encode(Path(LOGO_FILE).read_bytes()).decode("ascii")
                     return f"data:{mime};base64,{b64}"
@@ -542,9 +564,6 @@ with st.sidebar:
     meta_sidecar = None
     ingest_click = False
 
-
-
-
 # ---------- Main header ----------
 st.markdown(
     """
@@ -573,20 +592,17 @@ with col_right:
     if LOGO_FILE:
         st.image(str(LOGO_FILE), width=64)
 
-
 # ---------- RAG status banner ----------
 collection_for_status = _get_collection()
 if collection_for_status is not None:
     try:
-        st.info(f"Internal database is online.")
+        st.info("Internal database is online.")
     except Exception:
         st.info(f"RAG online. Collection '{TEXT_COLLECTION}' is available.")
 else:
     st.warning("RAG not available.")
 
 st.markdown("---")
-
-
 
 # ---------- Avatars + history ----------
 AVATAR_ASSISTANT = (str(ASSISTANT_ICON_FILE) if ASSISTANT_ICON_FILE else "🪸")
@@ -652,24 +668,23 @@ if prompt:
     refs_block = ""
     if st.session_state.use_rag:
         ctx = retrieve(prompt, k=6)
-        refs_block = build_apa_sources_note(ctx)
+        # Prefer external citations module if present, fallback to APA
+        refs_block = _try_external_references(ctx) or build_apa_sources_note(ctx)
 
     context_block = _build_context_block(ctx) if ctx else ""
 
     # Build conversation payload
-   # Build conversation payload
-    convo_msgs = []
+    convo_msgs: List[Dict[str, Any]] = []
     convo_msgs.append({
         "role": "system",
         "content": (
             "You are KelpGPT, a marine science research assistant for Kelp Ark. "
             "Prefer information from the provided context. If the user asks about a specific paper "
-            "(e.g., 'Jose's paper'), answer primarily from chunks whose metadata (paper_title/authors) match. "
-            "If context is missing, say so briefly and proceed with best knowledge."
-            "Include in-text citations for any data or reccomendations."
+            "(e.g., \"Jose's paper\"), answer primarily from chunks whose metadata (paper_title/authors) match. "
+            "If context is missing, say so briefly and then proceed with your best knowledge. "
+            "Include in-text citations for any data or recommendations."
         )
     })
-
 
     if context_block:
         convo_msgs.append({
@@ -696,7 +711,10 @@ if prompt:
 
             st.markdown(answer + (("\n\n" + refs_block) if refs_block else ""))
 
-    st.session_state.messages.append({"role": "assistant", "content": answer + (("\n\n" + refs_block) if refs_block else "")})
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": answer + (("\n\n" + refs_block) if refs_block else "")
+    })
 
 # ---------- Footer ----------
 st.markdown("---")
