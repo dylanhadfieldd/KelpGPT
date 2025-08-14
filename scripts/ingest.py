@@ -1,16 +1,16 @@
-# ingest.py
+# scripts/ingest.py
 # -----------------------------------------------------------------------------
 # Ingest PDFs into a persistent ChromaDB collection with OpenAI embeddings.
 # - Reads .env for: OPENAI_API_KEY, CHROMA_PERSIST_DIR, TEXT_COLLECTION, EMBED_MODEL
-# - Scans for PDFs under data/ and data/papers/ by default (recursive).
-# - Extracts core PDF metadata (title, authors, year) and stores:
-#     paper_title, authors, year, doc_id, page, chunk_index, source_filename
-# - Uses stable chunk IDs: "{doc_id}::p{page:04d}::c{chunk:04d}" and UP SERTs.
-# - Windows & Linux safe (absolute CHROMA path relative to this file).
+# - Scans for PDFs under <repo>/data/ and <repo>/data/papers/ by default (recursive).
+# - Stores per-chunk metadata: paper_title, authors, year, doc_id, page, chunk_index,
+#   source_filename, embedding_model.
+# - Windows & Linux safe. Paths resolve relative to the REPO ROOT (one level up).
 # - CLI:
-#     python ingest.py                       # scan default folders
-#     python ingest.py --path path\to\*.pdf  # glob(s) or folder(s)
-#     python ingest.py --clean doc_id_slug   # delete existing doc_id first
+#     python scripts/ingest.py                   # scan default folders
+#     python scripts/ingest.py --path data\*.pdf # specific glob(s) or folder(s)
+#     python scripts/ingest.py --clean doc_id    # delete existing doc before ingest
+#     python scripts/ingest.py --model text-embedding-3-large
 # -----------------------------------------------------------------------------
 
 import os
@@ -23,14 +23,16 @@ import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Iterable, Tuple, Optional
 
+# --- Resolve repo root even if this lives in scripts/ ---
+FILE_DIR = Path(__file__).parent.resolve()
+REPO_ROOT = FILE_DIR.parent if FILE_DIR.name.lower() == "scripts" else FILE_DIR
+
 # --- .env support (no Streamlit dependency here) ---
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(REPO_ROOT / ".env")  # load from repo root if present
 except Exception:
     pass
-
-ROOT = Path(__file__).parent.resolve()
 
 def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(name, default)
@@ -38,14 +40,14 @@ def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
 OPENAI_API_KEY  = _get_env("OPENAI_API_KEY", "")
 RAW_CHROMA_DIR  = _get_env("CHROMA_PERSIST_DIR", "chroma_db")
 TEXT_COLLECTION = _get_env("TEXT_COLLECTION", "papers_text")
-EMBED_MODEL     = _get_env("EMBED_MODEL", "text-embedding-3-small")  # 1536-d default
+DEFAULT_MODEL   = _get_env("EMBED_MODEL", "text-embedding-3-small")  # 1536-d default
 
 if not OPENAI_API_KEY:
     print("ERROR: OPENAI_API_KEY missing in environment or .env", file=sys.stderr)
     sys.exit(1)
 
-# Make persist dir absolute and consistent with app.py
-CHROMA_PERSIST_DIR = str((ROOT / RAW_CHROMA_DIR).resolve())
+# Absolute persist dir (relative to repo root)
+CHROMA_PERSIST_DIR = str((REPO_ROOT / RAW_CHROMA_DIR).resolve())
 
 # --- Chroma + Embeddings ---
 import chromadb
@@ -91,7 +93,6 @@ def _extract_pdf_core_metadata(file_bytes: bytes) -> Dict[str, Any]:
     return meta
 
 def _extract_pages_text(path: Path) -> List[str]:
-    """Return list of per-page extracted text (strings)."""
     texts: List[str] = []
     with path.open("rb") as fh:
         reader = PdfReader(fh)
@@ -104,7 +105,6 @@ def _extract_pages_text(path: Path) -> List[str]:
     return texts
 
 def _chunk_text_words(text: str, chunk_words: int = 900, overlap_words: int = 150) -> List[str]:
-    """Word-based chunking; match app's style. Returns list of chunk strings."""
     words = text.split()
     out: List[str] = []
     i = 0
@@ -126,29 +126,23 @@ def _iter_pdf_chunks(path: Path) -> Iterable[Tuple[int, int, str]]:
         for cidx, ctext in enumerate(chunks, start=1):
             yield pidx, cidx, _norm_ws(ctext)
 
-def _doc_id_for(path: Path, meta: Dict[str, Any], checksum: str) -> str:
-    """
-    Stable-ish doc_id:
-    - Prefer PDF title; fall back to filename stem.
-    - Do NOT include checksum in doc_id (so an updated file replaces via --clean).
-    - Keep checksum separately in metadata to detect changes.
-    """
+def _doc_id_for(path: Path, meta: Dict[str, Any]) -> str:
     base = meta.get("title") or path.stem
     return _slugify(base)  # e.g., "kelp-nitrogen-cycling-2021"
 
 # ------------------------- Core ingest -------------------------
 
-def build_embedding_fn() -> Any:
+def build_embedding_fn(embed_model: str):
     return embedding_functions.OpenAIEmbeddingFunction(
         api_key=OPENAI_API_KEY,
-        model_name=EMBED_MODEL,
+        model_name=embed_model,
     )
 
-def open_collection(ef) -> Any:
+def open_collection(ef, embed_model: str):
     cli = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
     col = cli.get_or_create_collection(
         name=TEXT_COLLECTION,
-        metadata={"embedding_model": EMBED_MODEL},
+        metadata={"embedding_model": embed_model},
         embedding_function=ef
     )
     return cli, col
@@ -160,14 +154,15 @@ def delete_doc(col, doc_id: str) -> None:
     except Exception as e:
         print(f"Warning: delete failed for doc_id='{doc_id}': {e}")
 
-def upsert_chunks(col, doc_id: str, file_path: Path, file_checksum: str, meta_core: Dict[str, Any]) -> int:
+def upsert_chunks(col, doc_id: str, file_path: Path, file_checksum: str,
+                  meta_core: Dict[str, Any], embed_model: str) -> int:
     ids: List[str] = []
     docs: List[str] = []
     metas: List[Dict[str, Any]] = []
 
     source_filename = file_path.name
-
     total = 0
+
     for page_idx, chunk_idx, chunk_text in _iter_pdf_chunks(file_path):
         cid = f"{doc_id}::p{page_idx:04d}::c{chunk_idx:04d}"
         ids.append(cid)
@@ -182,11 +177,11 @@ def upsert_chunks(col, doc_id: str, file_path: Path, file_checksum: str, meta_co
             "year": meta_core.get("year"),
             "page": page_idx,
             "chunk_index": chunk_idx,
-            "embedding_model": EMBED_MODEL,
+            "embedding_model": embed_model,
         })
         total += 1
 
-        # Batch every ~512 to keep memory low on Pi
+        # Batch write to keep memory low
         if len(ids) >= 512:
             col.upsert(ids=ids, documents=docs, metadatas=metas)
             ids, docs, metas = [], [], []
@@ -201,24 +196,24 @@ def upsert_chunks(col, doc_id: str, file_path: Path, file_checksum: str, meta_co
 def find_pdf_paths(sources: List[str]) -> List[Path]:
     paths: List[Path] = []
     if not sources:
-        # default: recurse under these folders
-        defaults = [ROOT / "data", ROOT / "data" / "papers"]
+        # default: recurse under these folders (repo root)
+        defaults = [REPO_ROOT / "data", REPO_ROOT / "data" / "papers"]
         for d in defaults:
-            paths.extend(d.rglob("*.pdf"))
+            if d.exists():
+                paths.extend(d.rglob("*.pdf"))
     else:
         for src in sources:
             p = Path(src)
             if p.is_dir():
                 paths.extend(p.rglob("*.pdf"))
             else:
-                # allow glob strings (Windows-friendly)
                 for g in glob.glob(src, recursive=True):
                     gp = Path(g)
                     if gp.is_dir():
                         paths.extend(gp.rglob("*.pdf"))
                     elif gp.suffix.lower() == ".pdf":
                         paths.append(gp)
-    # de-dup, keep order-ish
+    # de-dup
     seen, out = set(), []
     for p in paths:
         rp = p.resolve()
@@ -231,39 +226,37 @@ def main():
     ap = argparse.ArgumentParser(description="Ingest PDFs into ChromaDB with OpenAI embeddings.")
     ap.add_argument("--path", "-p", nargs="*", default=[], help="Folder(s), glob(s), or PDF file(s) to ingest")
     ap.add_argument("--clean", "-c", default="", help="If set, delete existing records for this doc_id before ingest")
-    ap.add_argument("--model", "-m", default=EMBED_MODEL, help="Embedding model name (default: env EMBED_MODEL)")
+    ap.add_argument("--model", "-m", default=DEFAULT_MODEL, help="Embedding model name (default: env EMBED_MODEL)")
     args = ap.parse_args()
 
-    global EMBED_MODEL
-    EMBED_MODEL = args.model
+    embed_model = args.model
 
-    ef = build_embedding_fn()
-    cli, col = open_collection(ef)
+    ef = build_embedding_fn(embed_model)
+    cli, col = open_collection(ef, embed_model)
 
     pdfs = find_pdf_paths(args.path)
-
     if not pdfs:
-        print("No PDFs found. Put files under ./data/ or ./data/papers/ or pass --path.", file=sys.stderr)
+        print(f"No PDFs found. Put files under '{REPO_ROOT / 'data'}' or pass --path.", file=sys.stderr)
         return
 
-    print(f"Indexing {len(pdfs)} PDF(s) into collection '{TEXT_COLLECTION}' at {CHROMA_PERSIST_DIR}")
+    print(f"Indexing {len(pdfs)} PDF(s) into '{TEXT_COLLECTION}' at {CHROMA_PERSIST_DIR}")
     for path in pdfs:
         try:
             file_bytes = path.read_bytes()
             meta_core = _extract_pdf_core_metadata(file_bytes)
             checksum = _file_checksum(path)
-            doc_id = _doc_id_for(path, meta_core, checksum)
+            doc_id = _doc_id_for(path, meta_core)
 
             if args.clean and args.clean == doc_id:
                 delete_doc(col, doc_id)
 
-            count = upsert_chunks(col, doc_id, path, checksum, meta_core)
+            count = upsert_chunks(col, doc_id, path, checksum, meta_core, embed_model)
             print(f" - {path.name}: doc_id='{doc_id}', chunks={count}")
 
         except Exception as e:
             print(f"ERROR processing {path}: {e}", file=sys.stderr)
 
-    # Print a tiny summary of the collection
+    # tiny summary
     try:
         got = col.get(include=[])
         n = len((got or {}).get("ids") or [])
