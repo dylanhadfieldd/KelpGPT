@@ -36,7 +36,7 @@ def _first_existing_local(*names: str) -> Optional[Path]:
 
 LOGO_FILE = _first_existing_local("logo_icon.png","logo_icon.jpg","kelp_ark_logo.png","kelp_ark_logo.jpg")
 ASSISTANT_ICON_FILE = _first_existing_local("icon_kelp.png","icon_kelp.jpg","kelp_icon.png","kelp_icon.jpg","model_avatar.png")
-USER_ICON_FILE      = _first_existing_local("test_tube.png","test_tube.jpg","icon_test_tube.png","icon_test_tube.jpg","user_model.png")
+USER_ICON_FILE      = _first_existing_local("user_avater.png","test_tube.jpg","icon_test_tube.png","icon_test_tube.jpg","user_model.png")
 
 st.set_page_config(page_title="KelpGPT", page_icon=(str(LOGO_FILE) if LOGO_FILE else "🪸"), layout="wide")
 
