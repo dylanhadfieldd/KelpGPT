@@ -1,16 +1,11 @@
 # scripts/ingest.py
 # -----------------------------------------------------------------------------
-# Ingest PDFs into a persistent ChromaDB collection with OpenAI embeddings.
-# - Reads .env for: OPENAI_API_KEY, CHROMA_PERSIST_DIR, TEXT_COLLECTION, EMBED_MODEL
-# - Scans for PDFs under <repo>/data/ and <repo>/data/papers/ by default (recursive).
-# - Stores per-chunk metadata: paper_title, authors, year, doc_id, page, chunk_index,
-#   source_filename, embedding_model.
-# - Windows & Linux safe. Paths resolve relative to the REPO ROOT (one level up).
-# - CLI:
-#     python scripts/ingest.py                   # scan default folders
-#     python scripts/ingest.py --path data\*.pdf # specific glob(s) or folder(s)
-#     python scripts/ingest.py --clean doc_id    # delete existing doc before ingest
-#     python scripts/ingest.py --model text-embedding-3-large
+# Robust PDF -> ChromaDB ingest with small embedding batches & retry logic.
+# - Safe on mildly corrupted PDFs (pypdf strict=False; skip unreadable pages).
+# - Small, configurable embedding batches (default 64) to avoid huge HTTP posts.
+# - Custom OpenAI embedder with retries and per-request timeouts.
+# - Metadata written per chunk: paper_title, authors, year, doc_id, page, chunk_index,
+#   source_filename, embedding_model (matches app.py).
 # -----------------------------------------------------------------------------
 
 import os
@@ -18,19 +13,21 @@ import io
 import re
 import sys
 import glob
+import time
+import math
 import argparse
 import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Iterable, Tuple, Optional
 
-# --- Resolve repo root even if this lives in scripts/ ---
+# ---------- Resolve repo root even if this lives in scripts/ ----------
 FILE_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = FILE_DIR.parent if FILE_DIR.name.lower() == "scripts" else FILE_DIR
 
-# --- .env support (no Streamlit dependency here) ---
+# ---------- .env support ----------
 try:
     from dotenv import load_dotenv
-    load_dotenv(REPO_ROOT / ".env")  # load from repo root if present
+    load_dotenv(REPO_ROOT / ".env")
 except Exception:
     pass
 
@@ -40,7 +37,7 @@ def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
 OPENAI_API_KEY  = _get_env("OPENAI_API_KEY", "")
 RAW_CHROMA_DIR  = _get_env("CHROMA_PERSIST_DIR", "chroma_db")
 TEXT_COLLECTION = _get_env("TEXT_COLLECTION", "papers_text")
-DEFAULT_MODEL   = _get_env("EMBED_MODEL", "text-embedding-3-small")  # 1536-d default
+DEFAULT_MODEL   = _get_env("EMBED_MODEL", "text-embedding-3-small")  # 1536-d
 
 if not OPENAI_API_KEY:
     print("ERROR: OPENAI_API_KEY missing in environment or .env", file=sys.stderr)
@@ -49,12 +46,37 @@ if not OPENAI_API_KEY:
 # Absolute persist dir (relative to repo root)
 CHROMA_PERSIST_DIR = str((REPO_ROOT / RAW_CHROMA_DIR).resolve())
 
-# --- Chroma + Embeddings ---
+# ---------- Chroma ----------
 import chromadb
-from chromadb.utils import embedding_functions
 
-# --- PDF parsing ---
+# ---------- OpenAI (custom embedder) ----------
+from openai import OpenAI
+from httpx import HTTPError
+
+class OpenAIEmbedder:
+    """Chroma-compatible embedding function with retries and timeouts."""
+    def __init__(self, api_key: str, model: str, timeout: float = 45.0, max_retries: int = 5, backoff: float = 1.5):
+        self.client = OpenAI(api_key=api_key, timeout=timeout)
+        self.model = model
+        self.max_retries = max_retries
+        self.backoff = backoff
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        # One call per upsert() batch
+        delay = 1.0
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = self.client.embeddings.create(model=self.model, input=input)
+                return [d.embedding for d in resp.data]
+            except (HTTPError, Exception) as e:
+                if attempt == self.max_retries:
+                    raise
+                time.sleep(delay)
+                delay *= self.backoff
+
+# ---------- PDF parsing ----------
 from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 # ------------------------- Helpers -------------------------
 
@@ -79,7 +101,8 @@ def _file_checksum(path: Path, block: int = 1 << 20) -> str:
 def _extract_pdf_core_metadata(file_bytes: bytes) -> Dict[str, Any]:
     meta = {"title": None, "authors": None, "year": None}
     try:
-        reader = PdfReader(io.BytesIO(file_bytes))
+        # strict=False to be lenient with slightly malformed metadata
+        reader = PdfReader(io.BytesIO(file_bytes), strict=False)
         info = reader.metadata or {}
         title = str(info.get("/Title", "") or info.get("Title", "") or "").strip() or None
         authors = str(info.get("/Author","") or info.get("Author","") or "").strip() or None
@@ -93,15 +116,24 @@ def _extract_pdf_core_metadata(file_bytes: bytes) -> Dict[str, Any]:
     return meta
 
 def _extract_pages_text(path: Path) -> List[str]:
+    """Return per-page text; tolerant to some corrupt PDFs."""
     texts: List[str] = []
-    with path.open("rb") as fh:
-        reader = PdfReader(fh)
-        for page in reader.pages:
-            try:
-                t = page.extract_text() or ""
-            except Exception:
-                t = ""
-            texts.append(t)
+    try:
+        reader = PdfReader(path.open("rb"), strict=False)
+    except PdfReadError as e:
+        print(f"!! Skipping file (cannot open): {path.name} — {e}", file=sys.stderr)
+        return texts
+    except Exception as e:
+        print(f"!! Skipping file (open error): {path.name} — {e}", file=sys.stderr)
+        return texts
+
+    for i, page in enumerate(reader.pages, start=1):
+        try:
+            t = page.extract_text() or ""
+        except Exception as e:
+            print(f"!! Skipping page {i} in {path.name}: {e}", file=sys.stderr)
+            t = ""
+        texts.append(t)
     return texts
 
 def _chunk_text_words(text: str, chunk_words: int = 900, overlap_words: int = 150) -> List[str]:
@@ -119,6 +151,8 @@ def _chunk_text_words(text: str, chunk_words: int = 900, overlap_words: int = 15
 def _iter_pdf_chunks(path: Path) -> Iterable[Tuple[int, int, str]]:
     """Yield (page_index, chunk_index, chunk_text) for each chunk."""
     pages = _extract_pages_text(path)
+    if not pages:
+        return
     for pidx, ptxt in enumerate(pages, start=1):
         if not ptxt.strip():
             continue
@@ -132,42 +166,23 @@ def _doc_id_for(path: Path, meta: Dict[str, Any]) -> str:
 
 # ------------------------- Core ingest -------------------------
 
-def build_embedding_fn(embed_model: str):
-    return embedding_functions.OpenAIEmbeddingFunction(
-        api_key=OPENAI_API_KEY,
-        model_name=embed_model,
-    )
-
-def open_collection(ef, embed_model: str):
+def open_collection(embedder) -> any:
     cli = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
     col = cli.get_or_create_collection(
         name=TEXT_COLLECTION,
-        metadata={"embedding_model": embed_model},
-        embedding_function=ef
+        metadata={"embedding_model": DEFAULT_MODEL},
+        embedding_function=embedder,
     )
     return cli, col
 
-def delete_doc(col, doc_id: str) -> None:
-    try:
-        col.delete(where={"doc_id": {"$eq": doc_id}})
-        print(f"Deleted existing records for doc_id='{doc_id}'")
-    except Exception as e:
-        print(f"Warning: delete failed for doc_id='{doc_id}': {e}")
-
 def upsert_chunks(col, doc_id: str, file_path: Path, file_checksum: str,
-                  meta_core: Dict[str, Any], embed_model: str) -> int:
-    ids: List[str] = []
-    docs: List[str] = []
-    metas: List[Dict[str, Any]] = []
+                  meta_core: Dict[str, Any], embed_model: str, batch_size: int = 64) -> int:
+    all_records: List[Tuple[str, str, Dict[str, Any]]] = []
 
     source_filename = file_path.name
-    total = 0
-
     for page_idx, chunk_idx, chunk_text in _iter_pdf_chunks(file_path):
         cid = f"{doc_id}::p{page_idx:04d}::c{chunk_idx:04d}"
-        ids.append(cid)
-        docs.append(chunk_text)
-        metas.append({
+        meta = {
             "doc_id": doc_id,
             "source_filename": source_filename,
             "file_path": str(file_path),
@@ -178,16 +193,26 @@ def upsert_chunks(col, doc_id: str, file_path: Path, file_checksum: str,
             "page": page_idx,
             "chunk_index": chunk_idx,
             "embedding_model": embed_model,
-        })
-        total += 1
+        }
+        all_records.append((cid, chunk_text, meta))
 
-        # Batch write to keep memory low
-        if len(ids) >= 512:
-            col.upsert(ids=ids, documents=docs, metadatas=metas)
-            ids, docs, metas = [], [], []
+    total = len(all_records)
+    if total == 0:
+        print(f"   (no readable text) {file_path.name}")
+        return 0
 
-    if ids:
+    # Batched upserts so each embeddings call is small
+    batches = math.ceil(total / batch_size)
+    for bi in range(batches):
+        start = bi * batch_size
+        end = min(total, start + batch_size)
+        batch = all_records[start:end]
+        ids = [r[0] for r in batch]
+        docs = [r[1] for r in batch]
+        metas = [r[2] for r in batch]
+
         col.upsert(ids=ids, documents=docs, metadatas=metas)
+        print(f"   • upserted batch {bi+1}/{batches} ({end-start} chunks)")
 
     return total
 
@@ -227,12 +252,14 @@ def main():
     ap.add_argument("--path", "-p", nargs="*", default=[], help="Folder(s), glob(s), or PDF file(s) to ingest")
     ap.add_argument("--clean", "-c", default="", help="If set, delete existing records for this doc_id before ingest")
     ap.add_argument("--model", "-m", default=DEFAULT_MODEL, help="Embedding model name (default: env EMBED_MODEL)")
+    ap.add_argument("--batch", "-b", type=int, default=64, help="Embedding/Upsert batch size (default 64)")
     args = ap.parse_args()
 
     embed_model = args.model
+    batch_size = max(8, min(256, args.batch))  # sane bounds
 
-    ef = build_embedding_fn(embed_model)
-    cli, col = open_collection(ef, embed_model)
+    embedder = OpenAIEmbedder(api_key=OPENAI_API_KEY, model=embed_model, timeout=45.0, max_retries=5, backoff=1.7)
+    cli, col = open_collection(embedder)
 
     pdfs = find_pdf_paths(args.path)
     if not pdfs:
@@ -244,15 +271,21 @@ def main():
         try:
             file_bytes = path.read_bytes()
             meta_core = _extract_pdf_core_metadata(file_bytes)
-            checksum = _file_checksum(path)
             doc_id = _doc_id_for(path, meta_core)
 
             if args.clean and args.clean == doc_id:
-                delete_doc(col, doc_id)
+                try:
+                    col.delete(where={"doc_id": {"$eq": doc_id}})
+                    print(f"Deleted existing records for doc_id='{doc_id}'")
+                except Exception as e:
+                    print(f"Warning: delete failed for doc_id='{doc_id}': {e}")
 
-            count = upsert_chunks(col, doc_id, path, checksum, meta_core, embed_model)
+            checksum = _file_checksum(path)
+            count = upsert_chunks(col, doc_id, path, checksum, meta_core, embed_model, batch_size=batch_size)
             print(f" - {path.name}: doc_id='{doc_id}', chunks={count}")
 
+        except PdfReadError as e:
+            print(f"!! Skipping file (PdfReadError): {path.name} — {e}", file=sys.stderr)
         except Exception as e:
             print(f"ERROR processing {path}: {e}", file=sys.stderr)
 
