@@ -1,11 +1,12 @@
 # scripts/ingest.py
 # -----------------------------------------------------------------------------
 # Robust PDF -> ChromaDB ingest with small embedding batches & retry logic.
-# - Safe on mildly corrupted PDFs (pypdf strict=False; skip unreadable pages).
+# - Tolerant to mildly corrupted PDFs (pypdf strict=False; skip unreadable pages).
 # - Small, configurable embedding batches (default 64) to avoid huge HTTP posts.
-# - Custom OpenAI embedder with retries and per-request timeouts.
-# - Metadata written per chunk: paper_title, authors, year, doc_id, page, chunk_index,
-#   source_filename, embedding_model (matches app.py).
+# - Custom OpenAI embedder with retries, timeouts, and a .name() method
+#   so Chroma's embedding-function validator is happy.
+# - Metadata per chunk matches app.py: paper_title, authors, year, doc_id,
+#   page, chunk_index, source_filename, embedding_model.
 # -----------------------------------------------------------------------------
 
 import os
@@ -61,6 +62,10 @@ class OpenAIEmbedder:
         self.max_retries = max_retries
         self.backoff = backoff
 
+    # Chroma calls this to check EF identity; returning a stable string avoids conflicts
+    def name(self) -> str:
+        return f"openai:{self.model}"
+
     def __call__(self, input: List[str]) -> List[List[float]]:
         # One call per upsert() batch
         delay = 1.0
@@ -68,7 +73,7 @@ class OpenAIEmbedder:
             try:
                 resp = self.client.embeddings.create(model=self.model, input=input)
                 return [d.embedding for d in resp.data]
-            except (HTTPError, Exception) as e:
+            except (HTTPError, Exception):
                 if attempt == self.max_retries:
                     raise
                 time.sleep(delay)
@@ -162,15 +167,15 @@ def _iter_pdf_chunks(path: Path) -> Iterable[Tuple[int, int, str]]:
 
 def _doc_id_for(path: Path, meta: Dict[str, Any]) -> str:
     base = meta.get("title") or path.stem
-    return _slugify(base)  # e.g., "kelp-nitrogen-cycling-2021"
+    return _slugify(base)
 
 # ------------------------- Core ingest -------------------------
 
-def open_collection(embedder) -> any:
+def open_collection(embedder, embed_model: str):
     cli = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
     col = cli.get_or_create_collection(
         name=TEXT_COLLECTION,
-        metadata={"embedding_model": DEFAULT_MODEL},
+        metadata={"embedding_model": embed_model},  # reflect the actual model
         embedding_function=embedder,
     )
     return cli, col
@@ -259,7 +264,7 @@ def main():
     batch_size = max(8, min(256, args.batch))  # sane bounds
 
     embedder = OpenAIEmbedder(api_key=OPENAI_API_KEY, model=embed_model, timeout=45.0, max_retries=5, backoff=1.7)
-    cli, col = open_collection(embedder)
+    cli, col = open_collection(embedder, embed_model)
 
     pdfs = find_pdf_paths(args.path)
     if not pdfs:
