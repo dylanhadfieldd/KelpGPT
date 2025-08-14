@@ -38,10 +38,10 @@ def _first_existing_local(*names: str) -> Optional[Path]:
     return None
 
 LOGO_FILE = _first_existing_local(
-    "logo_icon.png", "logo_icon.jpg", "kelp_ark_logo.png", "kelp_ark_logo.jpg"
+    "kelp_ark_logo.png", "logo_icon.jpg", "kelp_ark_logo.png", "kelp_ark_logo.jpg"
 )
 ASSISTANT_ICON_FILE = _first_existing_local(
-    "icon_kelp.png", "icon_kelp.jpg", "kelp_icon.png", "kelp_icon.jpg", "model_avatar.png"
+    "model_avatar.png", "icon_kelp.jpg", "kelp_icon.png", "kelp_icon.jpg", "model_avatar.png"
 )
 # fix typo: 'user_avater' -> 'user_avatar'
 USER_ICON_FILE = _first_existing_local(
